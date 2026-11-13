@@ -13,6 +13,27 @@ pub fn join_remote(base: &str, name: &str) -> String {
     }
 }
 
+/// Windows marks hidden files with a file attribute rather than a leading dot,
+/// so `desktop.ini` and friends have to be detected from metadata.
+pub fn is_hidden(name: &str, metadata: &std::fs::Metadata) -> bool {
+    if name.starts_with('.') {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0 {
+            return true;
+        }
+    }
+
+    let _ = metadata;
+    false
+}
+
 pub fn remote_parent(path: &str) -> String {
     let trimmed = path.trim_end_matches('/');
     if trimmed.is_empty() {

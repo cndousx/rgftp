@@ -820,6 +820,7 @@ impl RgFtpApp {
                         continue;
                     };
                     let is_dir = metadata.is_dir();
+                    let hidden = crate::util::is_hidden(&name, &metadata);
                     let modified = metadata
                         .modified()
                         .ok()
@@ -829,6 +830,7 @@ impl RgFtpApp {
                         path: entry_path.to_string_lossy().to_string(),
                         name,
                         is_dir,
+                        hidden,
                         size: if is_dir { 0 } else { metadata.len() },
                         modified,
                         permissions: None,
@@ -837,7 +839,7 @@ impl RgFtpApp {
                 sort_entries(&mut entries);
                 let all_entries = Arc::new(entries);
                 self.local.entries =
-                    Arc::new(filter_entries(&all_entries, &self.local_query, true));
+                    Arc::new(filter_entries(&all_entries, &self.local_query, false));
                 self.local.all_entries = all_entries;
                 self.local.path = path.clone();
                 self.local.selected = None;
@@ -954,7 +956,7 @@ impl RgFtpApp {
         self.local.entries = Arc::new(filter_entries(
             &self.local.all_entries,
             &self.local_query,
-            true,
+            false,
         ));
         self.local.selected = None;
         self.local_scroll.scroll_to_item(0, ScrollStrategy::Top);
@@ -4760,7 +4762,7 @@ fn filter_entries(entries: &[FileEntry], query: &str, show_hidden: bool) -> Vec<
     let query = query.trim();
     entries
         .iter()
-        .filter(|entry| show_hidden || !entry.name.starts_with('.'))
+        .filter(|entry| show_hidden || !entry.hidden)
         .filter(|entry| query.is_empty() || crate::util::fuzzy_match(&entry.name, query))
         .cloned()
         .collect()

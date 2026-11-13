@@ -297,6 +297,9 @@ pub struct FileEntry {
     pub modified: Option<i64>,
     /// Unix permission bits when the file system exposes them.
     pub permissions: Option<u32>,
+    /// Hidden files (dotfiles, or Windows hidden/system attribute) are kept in
+    /// `all_entries` but filtered out of the visible listing.
+    pub hidden: bool,
 }
 
 pub fn sort_entries(entries: &mut [FileEntry]) {

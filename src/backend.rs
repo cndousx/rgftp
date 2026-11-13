@@ -1,5 +1,5 @@
 use crate::model::{AuthMethod, ConnectionProfile, FileEntry, sort_entries};
-use crate::util::{expand_tilde, join_remote};
+use crate::util::{expand_tilde, is_hidden, join_remote};
 use async_channel::Sender;
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::{FileAttributes, OpenFlags};
@@ -712,6 +712,7 @@ async fn list_dir(sftp: &SftpSession, path: &str) -> Result<(String, Vec<FileEnt
         let file_type = metadata.file_type();
         let is_dir = file_type.is_dir();
         entries.push(FileEntry {
+            hidden: name.starts_with('.'),
             path: join_remote(&canonical, &name),
             name,
             is_dir,
@@ -787,6 +788,12 @@ fn local_total(root: &Path, cancel: &AtomicBool) -> Option<u64> {
                 continue;
             };
             for entry in read_dir.flatten() {
+                let Ok(metadata) = entry.metadata() else {
+                    continue;
+                };
+                if is_hidden(&entry.file_name().to_string_lossy(), &metadata) {
+                    continue;
+                }
                 stack.push(entry.path());
             }
         } else {
@@ -863,6 +870,12 @@ async fn upload_path(
                 return Err("已取消".to_string());
             }
             let name = entry.file_name().to_string_lossy().to_string();
+            let Ok(metadata) = entry.metadata().await else {
+                continue;
+            };
+            if is_hidden(&name, &metadata) {
+                continue;
+            }
             let child_local = entry.path();
             let child_remote = join_remote(remote, &name);
             Box::pin(upload_path(
