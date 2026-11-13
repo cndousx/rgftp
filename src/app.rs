@@ -2025,6 +2025,13 @@ impl RgFtpApp {
         let colors = cx.theme().colors;
         let dark = cx.theme().mode.is_dark();
         let is_macos = cfg!(target_os = "macos");
+        // `muted_foreground` is fairly dim on the dark title bar, which makes the
+        // thin window-control glyphs hard to read. Brighten them in dark mode.
+        let control_fg = if dark {
+            colors.foreground.opacity(0.85)
+        } else {
+            colors.muted_foreground
+        };
 
         let control_button =
             |id: &'static str, icon: IconName, area: WindowControlArea, close: bool| {
@@ -2045,12 +2052,12 @@ impl RgFtpApp {
                 div()
                     .id(id)
                     .h_full()
-                    .w(px(42.0))
+                    .w(px(46.0))
                     .flex_shrink_0()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_color(colors.muted_foreground)
+                    .text_color(control_fg)
                     .window_control_area(area)
                     .hover(move |this| this.bg(hover_bg).text_color(hover_fg))
                     .when(!cfg!(target_os = "windows"), |this| {
@@ -2064,7 +2071,7 @@ impl RgFtpApp {
                             }
                         })
                     })
-                    .child(Icon::new(icon).xsmall())
+                    .child(Icon::new(icon).small())
                     .into_any_element()
             };
 
@@ -2136,7 +2143,7 @@ impl RgFtpApp {
             .child(
                 Button::new("theme-toggle")
                     .ghost()
-                    .xsmall()
+                    .small()
                     .icon(if dark { IconName::Sun } else { IconName::Moon })
                     .tooltip(if dark {
                         "切换到浅色主题"
