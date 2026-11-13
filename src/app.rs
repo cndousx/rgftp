@@ -169,6 +169,7 @@ struct ContextMenuState {
 
 struct ConnectionForm {
     editing_id: Option<String>,
+    copying: bool,
     group_id: Option<String>,
     name: Entity<InputState>,
     host: Entity<InputState>,
@@ -1334,6 +1335,7 @@ impl RgFtpApp {
 
         self.dialog = DialogState::Connection(ConnectionForm {
             editing_id: None,
+            copying: false,
             group_id: Some(group_id),
             name,
             host,
@@ -1377,6 +1379,57 @@ impl RgFtpApp {
 
         self.dialog = DialogState::Connection(ConnectionForm {
             editing_id: Some(profile.id),
+            copying: false,
+            group_id: profile.group_id,
+            name,
+            host,
+            port,
+            username,
+            password,
+            key_path,
+            passphrase,
+            remote_dir,
+            use_key,
+            error: None,
+        });
+        if let DialogState::Connection(form) = &self.dialog {
+            form.name.update(cx, |state, cx| state.focus(window, cx));
+        }
+        cx.notify();
+    }
+
+    fn open_copy_connection(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.context_menu = None;
+        let Some(profile) = self.settings.connection(id).cloned() else {
+            return;
+        };
+        let (use_key, password_value, key_path, passphrase) = match &profile.auth {
+            AuthMethod::Password { password } => {
+                (false, password.clone(), String::new(), String::new())
+            }
+            AuthMethod::PrivateKey { path, passphrase } => {
+                (true, String::new(), path.clone(), passphrase.clone())
+            }
+        };
+
+        let name = make_input(
+            window,
+            cx,
+            "连接名称",
+            &format!("{} 副本", profile.name),
+            false,
+        );
+        let host = make_input(window, cx, "example.com", &profile.host, false);
+        let port = make_input(window, cx, "22", &profile.port.to_string(), false);
+        let username = make_input(window, cx, "root", &profile.username, false);
+        let password = make_input(window, cx, "密码", &password_value, true);
+        let key_path = make_input(window, cx, "~/.ssh/id_ed25519", &key_path, false);
+        let passphrase = make_input(window, cx, "私钥口令（可选）", &passphrase, true);
+        let remote_dir = make_input(window, cx, "/home/user（可选）", &profile.remote_dir, false);
+
+        self.dialog = DialogState::Connection(ConnectionForm {
+            editing_id: None,
+            copying: true,
             group_id: profile.group_id,
             name,
             host,
@@ -1981,7 +2034,10 @@ impl RgFtpApp {
                     colors.secondary_hover
                 };
                 let hover_fg = if close {
-                    colors.danger_foreground
+                    // `danger_foreground` is a dark red in the dark theme, which
+                    // leaves the close glyph barely visible on the red hover
+                    // background. Plain white reads clearly in both themes.
+                    white()
                 } else {
                     colors.foreground
                 };
@@ -3349,12 +3405,17 @@ impl RgFtpApp {
 
     fn render_status_bar(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors;
+        let status_bg: Hsla = if cx.theme().mode.is_dark() {
+            rgb(0x2e2e2e).into()
+        } else {
+            rgb(0xf8f8f8).into()
+        };
 
         v_flex()
             .flex_shrink_0()
             .border_t_1()
-            .border_color(colors.border)
-            .bg(colors.sidebar)
+            .border_color(colors.status_bar_border)
+            .bg(status_bg)
             .when_some(self.transfer.as_ref(), |this, transfer| {
                 this.child(self.render_transfer_row(transfer, cx))
             })
@@ -3383,7 +3444,7 @@ impl RgFtpApp {
             .px_3()
             .gap_3()
             .border_b_1()
-            .border_color(colors.border)
+            .border_color(colors.status_bar_border)
             .child(
                 Icon::new(match transfer.direction {
                     Direction::Upload => IconName::Upload,
@@ -3737,6 +3798,21 @@ impl RgFtpApp {
                 }
 
                 items.push(context_menu_item(
+                    "ctx-connection-copy",
+                    IconName::Copy,
+                    "复制连接",
+                    false,
+                    colors,
+                    cx.listener({
+                        let id = id.clone();
+                        move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.context_menu = None;
+                            this.open_copy_connection(&id, window, cx);
+                        }
+                    }),
+                ));
+                items.push(context_menu_item(
                     "ctx-connection-edit",
                     IconName::Pencil,
                     "编辑连接",
@@ -3816,6 +3892,7 @@ impl RgFtpApp {
                 .top_0()
                 .left_0()
                 .size_full()
+                .occlude()
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| this.close_context_menu(cx)),
@@ -3931,7 +4008,11 @@ impl RgFtpApp {
             .items_center()
             .justify_center()
             .bg(hsla(0.0, 0.0, 0.0, 0.34))
-            .on_click(cx.listener(|this, _, _, cx| this.close_dialog(cx)))
+            // The backdrop floats above the file lists and sidebar. Without
+            // this, their hitboxes stay "hovered" through the overlay, so a
+            // text selection drag inside a dialog input can start dragging the
+            // file/connection row underneath the pointer.
+            .occlude()
             .child(panel)
             .into_any_element()
     }
@@ -4134,7 +4215,9 @@ impl RgFtpApp {
             .into_any_element();
 
         self.render_dialog_shell(
-            if editing {
+            if form.copying {
+                "复制连接"
+            } else if editing {
                 "编辑连接"
             } else {
                 "新建连接"
