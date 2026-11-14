@@ -1510,6 +1510,8 @@ impl RgFtpApp {
     /// server pane.
     fn prompt_next_overwrite(&mut self, cx: &mut Context<Self>) {
         let Some(upload) = self.pending_overwrite.front().cloned() else {
+            // No more conflicts: drop the attention hint from the taskbar.
+            crate::taskbar::clear_notification();
             return;
         };
         self.dialog = DialogState::Confirm(ConfirmDialog {
@@ -1519,6 +1521,9 @@ impl RgFtpApp {
             confirm_label: "覆盖".into(),
             danger: false,
         });
+        // The dialog can appear while the app is not focused, so play a sound
+        // and blink a red badge on the taskbar button as well.
+        crate::taskbar::notify();
         cx.notify();
     }
 
