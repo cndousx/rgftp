@@ -290,6 +290,8 @@ pub struct RgFtpApp {
     next_toast_id: u64,
     pending_overwrite: std::collections::VecDeque<QueuedUpload>,
     sidebar_drop_target: Option<SidebarDropTarget>,
+    /// A file drag is hovering the remote pane while no session is connected.
+    remote_drag_blocked: bool,
 }
 
 impl RgFtpApp {
@@ -359,6 +361,7 @@ impl RgFtpApp {
             next_toast_id: 1,
             pending_overwrite: std::collections::VecDeque::new(),
             sidebar_drop_target: None,
+            remote_drag_blocked: false,
         };
 
         app._search_subscriptions = vec![
@@ -1144,12 +1147,14 @@ impl RgFtpApp {
     }
 
     fn upload_external_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        self.clear_remote_drag_state(cx);
         let Some((session_id, remote_path)) = self
             .active_session_state()
             .map(|session| (session.info.profile_id.clone(), session.pane.path.clone()))
         else {
             self.status = "请先连接服务器再上传文件".into();
             self.status_kind = StatusKind::Error;
+            self.push_toast(ToastKind::Error, "请先连接服务器再上传文件", cx);
             cx.notify();
             return;
         };
@@ -1158,6 +1163,7 @@ impl RgFtpApp {
     }
 
     fn handle_drop_on_remote(&mut self, item: DragItem, cx: &mut Context<Self>) {
+        self.clear_remote_drag_state(cx);
         if item.source != Side::Local {
             return;
         }
@@ -1167,6 +1173,7 @@ impl RgFtpApp {
         else {
             self.status = "请先连接服务器再上传文件".into();
             self.status_kind = StatusKind::Error;
+            self.push_toast(ToastKind::Error, "请先连接服务器再上传文件", cx);
             cx.notify();
             return;
         };
@@ -1216,6 +1223,37 @@ impl RgFtpApp {
     ) {
         if self.sidebar_drop_target != target {
             self.sidebar_drop_target = target;
+            cx.notify();
+        }
+    }
+
+    /// While a file drag hovers the remote pane without a connected session,
+    /// show a not-allowed cursor and a hint instead of silently ignoring the drop.
+    fn update_remote_drag_state(
+        &mut self,
+        hovering: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let blocked = hovering && self.active_session_state().is_none();
+        if blocked {
+            cx.set_active_drag_cursor_style(CursorStyle::OperationNotAllowed, window);
+            set_drag_block_cursor(true);
+        } else if self.remote_drag_blocked {
+            // Leaving the pane releases the cursor override we installed above.
+            cx.set_active_drag_cursor_style(CursorStyle::Arrow, window);
+            set_drag_block_cursor(false);
+        }
+        if self.remote_drag_blocked != blocked {
+            self.remote_drag_blocked = blocked;
+            cx.notify();
+        }
+    }
+
+    fn clear_remote_drag_state(&mut self, cx: &mut Context<Self>) {
+        if self.remote_drag_blocked {
+            self.remote_drag_blocked = false;
+            set_drag_block_cursor(false);
             cx.notify();
         }
     }
@@ -3069,6 +3107,7 @@ impl RgFtpApp {
 
     fn render_remote_pane(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors;
+        let connected = self.active_session_state().is_some();
 
         v_flex()
             .id("remote-pane")
@@ -3080,14 +3119,54 @@ impl RgFtpApp {
             .border_color(colors.border)
             .bg(colors.background)
             .overflow_hidden()
-            .drag_over::<DragItem>(|this, _, _, cx| {
-                this.bg(cx.theme().colors.primary.opacity(0.05))
-                    .border_color(cx.theme().colors.primary)
+            .drag_over::<DragItem>(move |this, _, _, cx| {
+                if connected {
+                    this.bg(cx.theme().colors.primary.opacity(0.05))
+                        .border_color(cx.theme().colors.primary)
+                } else {
+                    this.bg(cx.theme().colors.danger.opacity(0.06))
+                        .border_color(cx.theme().colors.danger)
+                }
             })
-            .drag_over::<ExternalPaths>(|this, _, _, cx| {
-                this.bg(cx.theme().colors.primary.opacity(0.05))
-                    .border_color(cx.theme().colors.primary)
+            .drag_over::<ExternalPaths>(move |this, _, _, cx| {
+                if connected {
+                    this.bg(cx.theme().colors.primary.opacity(0.05))
+                        .border_color(cx.theme().colors.primary)
+                } else {
+                    this.bg(cx.theme().colors.danger.opacity(0.06))
+                        .border_color(cx.theme().colors.danger)
+                }
             })
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<DragItem>, window, cx| {
+                    this.update_remote_drag_state(
+                        event.bounds.contains(&event.event.position),
+                        window,
+                        cx,
+                    );
+                }),
+            )
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<ExternalPaths>, window, cx| {
+                    this.update_remote_drag_state(
+                        event.bounds.contains(&event.event.position),
+                        window,
+                        cx,
+                    );
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, _, _, cx| {
+                // A cancelled drag never reaches `on_drop`, so clear the hint as
+                // soon as the pointer moves again without an active drag.
+                if !cx.has_active_drag() {
+                    this.clear_remote_drag_state(cx);
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.clear_remote_drag_state(cx)),
+            )
+            .on_file_drop_exit(cx.listener(|this, _, _, cx| this.clear_remote_drag_state(cx)))
             .on_drop(cx.listener(|this, item: &DragItem, _, cx| {
                 this.handle_drop_on_remote(item.clone(), cx)
             }))
@@ -3273,6 +3352,33 @@ impl RgFtpApp {
                             .text_xs()
                             .text_color(colors.muted_foreground)
                             .child("正在建立 SSH 会话并启动 SFTP"),
+                    )
+                    .into_any_element();
+            }
+
+            if self.remote_drag_blocked {
+                return v_flex()
+                    .flex_1()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .child(
+                        Icon::new(IconName::CircleAlert)
+                            .size(px(38.0))
+                            .text_color(colors.danger),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_medium()
+                            .text_color(colors.danger)
+                            .child("请先连接服务器"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(colors.muted_foreground)
+                            .child("拖拽上传前需要先从左侧选择并登录一个服务器"),
                     )
                     .into_any_element();
             }
@@ -4884,6 +4990,27 @@ fn render_pane_error(
                 .child(message.to_string()),
         )
         .into_any_element()
+}
+
+/// Forces the OS cursor while a file drag is in progress on Windows.
+///
+/// GPUI skips platform cursor updates while the mouse is captured (which is the
+/// case during a drag), so the not-allowed cursor has to be applied directly.
+fn set_drag_block_cursor(blocked: bool) {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::{IDC_ARROW, IDC_NO, LoadCursorW, SetCursor};
+        let cursor_name = if blocked { IDC_NO } else { IDC_ARROW };
+        unsafe {
+            if let Ok(cursor) = LoadCursorW(None, cursor_name) {
+                SetCursor(Some(cursor));
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = blocked;
+    }
 }
 
 fn render_empty_pane(
