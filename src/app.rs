@@ -2098,10 +2098,21 @@ impl RgFtpApp {
                     .gap_0()
                     .child(div().text_sm().font_semibold().child("RGFTP"))
                     .child(
-                        div()
-                            .text_xs()
-                            .text_color(colors.muted_foreground)
-                            .child("SFTP 文件传输"),
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(colors.muted_foreground)
+                                    .child("SFTP 文件传输"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(colors.muted_foreground.opacity(0.7))
+                                    .child(concat!("v", env!("CARGO_PKG_VERSION"))),
+                            ),
                     ),
             )
             .child(div().flex_1());
@@ -2871,17 +2882,7 @@ impl RgFtpApp {
                                 .child("从左侧选择一个服务器，或者新建连接"),
                         ),
                 )
-                .child(div().flex_1())
-                .child(
-                    Button::new("connection-bar-new")
-                        .secondary()
-                        .small()
-                        .icon(IconName::Plus)
-                        .label("新建连接")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_new_connection(None, window, cx)
-                        })),
-                );
+                .child(div().flex_1());
         }
 
         bar.into_any_element()
@@ -3292,16 +3293,6 @@ impl RgFtpApp {
                         .text_xs()
                         .text_color(colors.muted_foreground)
                         .child("从左侧选择一个连接，或者新建一个连接"),
-                )
-                .child(
-                    Button::new("empty-new-connection")
-                        .primary()
-                        .small()
-                        .icon(IconName::Plus)
-                        .label("新建连接")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_new_connection(None, window, cx)
-                        })),
                 )
                 .into_any_element();
         };
