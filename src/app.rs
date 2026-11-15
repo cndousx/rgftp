@@ -20,7 +20,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 use std::time::{Instant, UNIX_EPOCH};
@@ -130,6 +130,26 @@ struct TransferView {
     message: String,
 }
 
+impl TransferView {
+    fn new(id: u64, name: String, direction: Direction, total: u64) -> Self {
+        Self {
+            id,
+            name,
+            direction,
+            total,
+            transferred: 0,
+            speed: 0.0,
+            last_sample: Instant::now(),
+            last_bytes: 0,
+            done: false,
+            ok: true,
+            cancelled: false,
+            cancelling: false,
+            message: String::new(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ToastKind {
     Success,
@@ -221,6 +241,46 @@ struct QueuedUpload {
     name: String,
 }
 
+/// A single upload or download waiting to be dispatched to the backend.
+#[derive(Clone)]
+enum TransferRequest {
+    Upload {
+        session_id: String,
+        local: PathBuf,
+        remote: String,
+        name: String,
+    },
+    Download {
+        session_id: String,
+        remote: String,
+        local: PathBuf,
+        name: String,
+    },
+}
+
+impl TransferRequest {
+    fn direction(&self) -> Direction {
+        match self {
+            Self::Upload { .. } => Direction::Upload,
+            Self::Download { .. } => Direction::Download,
+        }
+    }
+
+    fn name(&self) -> &str {
+        match self {
+            Self::Upload { name, .. } | Self::Download { name, .. } => name,
+        }
+    }
+}
+
+/// A transfer that has been queued behind the active one.
+#[derive(Clone)]
+struct QueuedTransfer {
+    /// App-local identifier, used to remove a specific queued task.
+    queue_id: u64,
+    request: TransferRequest,
+}
+
 #[derive(Clone)]
 enum ConfirmAction {
     DeleteConnection(String),
@@ -275,7 +335,9 @@ pub struct RgFtpApp {
     connecting: HashSet<String>,
     dialog: DialogState,
     transfer: Option<TransferView>,
-    pending_transfers: usize,
+    transfer_queue: VecDeque<QueuedTransfer>,
+    transfer_queue_scroll: UniformListScrollHandle,
+    next_queue_id: u64,
     status: SharedString,
     status_kind: StatusKind,
     collapsed_groups: HashSet<String>,
@@ -346,7 +408,9 @@ impl RgFtpApp {
             connecting: HashSet::new(),
             dialog: DialogState::None,
             transfer: None,
-            pending_transfers: 0,
+            transfer_queue: VecDeque::new(),
+            transfer_queue_scroll: UniformListScrollHandle::new(),
+            next_queue_id: 1,
             status: "从左侧选择一个连接开始".into(),
             status_kind: StatusKind::Info,
             collapsed_groups,
@@ -527,21 +591,7 @@ impl RgFtpApp {
                 direction,
                 total,
             } => {
-                self.transfer = Some(TransferView {
-                    id,
-                    name: name.clone(),
-                    direction,
-                    total,
-                    transferred: 0,
-                    speed: 0.0,
-                    last_sample: Instant::now(),
-                    last_bytes: 0,
-                    done: false,
-                    ok: true,
-                    cancelled: false,
-                    cancelling: false,
-                    message: String::new(),
-                });
+                self.transfer = Some(TransferView::new(id, name.clone(), direction, total));
                 self.status = format!("{} {}", direction.label(), name).into();
                 self.status_kind = StatusKind::Info;
             }
@@ -581,7 +631,6 @@ impl RgFtpApp {
                 cancelled,
                 message,
             } => {
-                self.pending_transfers = self.pending_transfers.saturating_sub(1);
                 if let Some(transfer) = &mut self.transfer
                     && transfer.id == id
                 {
@@ -592,16 +641,6 @@ impl RgFtpApp {
                     transfer.message = message.clone();
                     if transfer.total > 0 && !cancelled {
                         transfer.transferred = transfer.total;
-                    }
-                }
-
-                if self.pending_transfers == 0 {
-                    match direction {
-                        Direction::Upload => self.refresh_session_remote(&session_id, cx),
-                        Direction::Download => {
-                            let path = self.local.path.clone();
-                            self.load_local_dir(path, cx);
-                        }
                     }
                 }
 
@@ -626,8 +665,22 @@ impl RgFtpApp {
                 }
 
                 // Every outcome is reported by a toast, so the progress row
-                // disappears as soon as the transfer finishes.
+                // disappears as soon as the transfer finishes. Refresh both
+                // panes so partial or completed transfers show up right away,
+                // re-applying the current search query and hidden-file setting.
                 self.transfer = None;
+                let local_path = self.local.path.clone();
+                self.load_local_dir(local_path, cx);
+                self.refresh_session_remote(&session_id, cx);
+                if let Some(active_id) = self.active_session.clone()
+                    && active_id != session_id
+                {
+                    self.refresh_session_remote(&active_id, cx);
+                }
+
+                // The next queued task, if any, starts after the refresh
+                // requests have been queued, so its listing is up to date.
+                self.start_next_transfer(cx);
             }
             BackendEvent::FileOpFinished {
                 session_id,
@@ -750,13 +803,9 @@ impl RgFtpApp {
             .into_any_element()
     }
 
-    /// Whether any upload / download is still running.
+    /// Whether a transfer is running or more are waiting in the queue.
     fn is_transferring(&self) -> bool {
-        self.pending_transfers > 0
-            || self
-                .transfer
-                .as_ref()
-                .is_some_and(|transfer| !transfer.done)
+        self.transfer.is_some() || !self.transfer_queue.is_empty()
     }
 
     /// Mirrors the running transfer onto the Windows taskbar button, and
@@ -766,7 +815,7 @@ impl RgFtpApp {
             Some(transfer) if !transfer.done => {
                 crate::taskbar::set_progress(transfer.transferred, transfer.total);
             }
-            _ if self.pending_transfers > 0 => {
+            _ if !self.transfer_queue.is_empty() => {
                 crate::taskbar::set_progress(0, 0);
             }
             _ => crate::taskbar::clear(),
@@ -1094,18 +1143,122 @@ impl RgFtpApp {
         })
     }
 
-    fn start_upload(&mut self, upload: QueuedUpload, cx: &mut Context<Self>) {
-        self.pending_transfers += 1;
-        self.worker.send(BackendCommand::Upload {
-            session_id: upload.session_id,
-            local: upload.local,
-            remote: upload.remote,
-            display_name: upload.name,
-        });
+    /// Adds a transfer to the queue, or starts it immediately when idle.
+    fn enqueue_transfer(&mut self, request: TransferRequest, cx: &mut Context<Self>) {
+        if self.transfer.is_some() {
+            let direction = request.direction();
+            let name = request.name().to_string();
+            let queue_id = self.next_queue_id;
+            self.next_queue_id += 1;
+            let first_in_queue = self.transfer_queue.is_empty();
+            self.transfer_queue
+                .push_back(QueuedTransfer { queue_id, request });
+            self.status = format!("{}已加入队列：{name}", direction.label()).into();
+            self.status_kind = StatusKind::Info;
+            if first_in_queue {
+                self.transfer_queue_scroll
+                    .scroll_to_item(0, ScrollStrategy::Top);
+                Self::refresh_scrollbar_layout(cx);
+            }
+            cx.notify();
+            return;
+        }
+
+        self.start_transfer(request, cx);
+    }
+
+    /// Sends one transfer to the worker and shows it in the progress row.
+    fn start_transfer(&mut self, request: TransferRequest, cx: &mut Context<Self>) {
+        let direction = request.direction();
+        let name = request.name().to_string();
+        // The backend assigns the real transfer id with `TransferStarted`; the
+        // placeholder lets the progress row appear before that event arrives.
+        self.transfer = Some(TransferView::new(0, name.clone(), direction, 0));
+        self.status = format!("{} {}", direction.label(), name).into();
+        self.status_kind = StatusKind::Info;
+
+        match request {
+            TransferRequest::Upload {
+                session_id,
+                local,
+                remote,
+                name,
+            } => {
+                self.worker.send(BackendCommand::Upload {
+                    session_id,
+                    local,
+                    remote,
+                    display_name: name,
+                });
+            }
+            TransferRequest::Download {
+                session_id,
+                remote,
+                local,
+                name,
+            } => {
+                self.worker.send(BackendCommand::Download {
+                    session_id,
+                    remote,
+                    local,
+                    display_name: name,
+                });
+            }
+        }
         cx.notify();
     }
 
-    /// Starts uploads that do not collide, then asks about each collision.
+    /// Starts the next queued transfer once the active one finishes.
+    fn start_next_transfer(&mut self, cx: &mut Context<Self>) {
+        if self
+            .transfer
+            .as_ref()
+            .is_some_and(|transfer| !transfer.done)
+        {
+            return;
+        }
+        let Some(queued) = self.transfer_queue.pop_front() else {
+            return;
+        };
+        self.start_transfer(queued.request, cx);
+    }
+
+    fn cancel_queued_transfer(&mut self, queue_id: u64, cx: &mut Context<Self>) {
+        let Some(index) = self
+            .transfer_queue
+            .iter()
+            .position(|queued| queued.queue_id == queue_id)
+        else {
+            return;
+        };
+        let Some(queued) = self.transfer_queue.remove(index) else {
+            return;
+        };
+        let direction = queued.request.direction();
+        let name = queued.request.name().to_string();
+        self.status = format!("已取消排队{}：{name}", direction.label()).into();
+        self.status_kind = StatusKind::Info;
+        self.push_toast(
+            ToastKind::Cancel,
+            format!("{}已取消：{name}", direction.label()),
+            cx,
+        );
+        cx.notify();
+    }
+
+    fn enqueue_upload(&mut self, upload: QueuedUpload, cx: &mut Context<Self>) {
+        self.enqueue_transfer(
+            TransferRequest::Upload {
+                session_id: upload.session_id,
+                local: upload.local,
+                remote: upload.remote,
+                name: upload.name,
+            },
+            cx,
+        );
+    }
+
+    /// Queues uploads that do not collide, then asks about each collision.
     fn enqueue_uploads(
         &mut self,
         session_id: String,
@@ -1132,14 +1285,14 @@ impl RgFtpApp {
             }
         }
 
-        let started = ready.len();
+        let added = ready.len();
         for upload in ready {
-            self.start_upload(upload, cx);
+            self.enqueue_upload(upload, cx);
         }
         self.pending_overwrite.extend(conflicts);
 
-        if started > 0 {
-            self.status = format!("已加入 {started} 个上传任务").into();
+        if added > 0 {
+            self.status = format!("已加入 {added} 个上传任务").into();
             self.status_kind = StatusKind::Info;
         }
         self.prompt_next_overwrite(cx);
@@ -1180,9 +1333,6 @@ impl RgFtpApp {
 
         let local = PathBuf::from(item.path);
         self.enqueue_uploads(session_id, remote_path, vec![local], cx);
-        self.status = "开始上传".into();
-        self.status_kind = StatusKind::Info;
-        cx.notify();
     }
 
     fn handle_drop_on_local(&mut self, item: DragItem, cx: &mut Context<Self>) {
@@ -1197,16 +1347,15 @@ impl RgFtpApp {
         };
 
         let local = self.local.path.join(&item.name);
-        self.pending_transfers += 1;
-        self.worker.send(BackendCommand::Download {
-            session_id,
-            remote: item.path,
-            local,
-            display_name: item.name,
-        });
-        self.status = "开始下载".into();
-        self.status_kind = StatusKind::Info;
-        cx.notify();
+        self.enqueue_transfer(
+            TransferRequest::Download {
+                session_id,
+                remote: item.path,
+                local,
+                name: item.name,
+            },
+            cx,
+        );
     }
 
     fn toggle_group(&mut self, id: String, cx: &mut Context<Self>) {
@@ -1879,7 +2028,7 @@ impl RgFtpApp {
             ConfirmAction::UploadOverwrite(upload) => {
                 self.pending_overwrite.pop_front();
                 self.dialog = DialogState::None;
-                self.start_upload(upload, cx);
+                self.enqueue_upload(upload, cx);
                 self.prompt_next_overwrite(cx);
                 cx.notify();
                 return;
@@ -3530,6 +3679,9 @@ impl RgFtpApp {
             .when_some(self.transfer.as_ref(), |this, transfer| {
                 this.child(self.render_transfer_row(transfer, cx))
             })
+            .when(!self.transfer_queue.is_empty(), |this| {
+                this.child(self.render_transfer_queue(cx))
+            })
             .into_any_element()
     }
 
@@ -3635,6 +3787,127 @@ impl RgFtpApp {
                         .child(Icon::new(IconName::X).xsmall()),
                 )
             })
+            .into_any_element()
+    }
+
+    /// Lists the transfers waiting behind the active one. At most three rows
+    /// are visible; more than that scrolls.
+    fn render_transfer_queue(&self, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors;
+        let items: Vec<QueuedTransfer> = self.transfer_queue.iter().cloned().collect();
+        let count = items.len();
+        let visible_rows = count.min(3);
+        let row_height = 30.0_f32;
+        let view = cx.entity();
+
+        let list = uniform_list("transfer-queue", count, move |range, _window, _cx| {
+            range
+                .map(|index| {
+                    let item = &items[index];
+                    let queue_id = item.queue_id;
+                    let direction = item.request.direction();
+                    let name = item.request.name().to_string();
+                    let view = view.clone();
+
+                    h_flex()
+                        .id(("transfer-queue-row", queue_id))
+                        .h(px(row_height))
+                        .w_full()
+                        .pl_3()
+                        .pr(px(16.0))
+                        .gap_3()
+                        .border_b_1()
+                        .border_color(colors.status_bar_border)
+                        .child(
+                            Icon::new(match direction {
+                                Direction::Upload => IconName::Upload,
+                                Direction::Download => IconName::Download,
+                            })
+                            .xsmall()
+                            .text_color(colors.muted_foreground),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_xs()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .child(format!("{} {}", direction.label(), name)),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_xs()
+                                .text_color(colors.muted_foreground)
+                                .child("等待中"),
+                        )
+                        .child(
+                            div()
+                                .id(("cancel-queued-transfer", queue_id))
+                                .size(px(22.0))
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .text_color(colors.muted_foreground)
+                                .hover(|this| {
+                                    this.bg(colors.danger.opacity(0.16))
+                                        .text_color(colors.danger)
+                                })
+                                .tooltip(|window, cx| {
+                                    Tooltip::new("取消此传输任务").build(window, cx)
+                                })
+                                .on_click(move |_, _, cx| {
+                                    view.update(cx, |app, cx| {
+                                        app.cancel_queued_transfer(queue_id, cx);
+                                    });
+                                })
+                                .child(Icon::new(IconName::X).xsmall()),
+                        )
+                        .into_any_element()
+                })
+                .collect::<Vec<_>>()
+        })
+        .track_scroll(&self.transfer_queue_scroll)
+        .h_full()
+        .w_full();
+
+        v_flex()
+            .flex_shrink_0()
+            .w_full()
+            .child(
+                h_flex()
+                    .h(px(24.0))
+                    .px_3()
+                    .border_b_1()
+                    .border_color(colors.status_bar_border)
+                    .text_xs()
+                    .text_color(colors.muted_foreground)
+                    .child(format!("等待传输（{count}）")),
+            )
+            .child(
+                div()
+                    .relative()
+                    .w_full()
+                    .h(px(row_height * visible_rows as f32))
+                    .child(list)
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .bottom_0()
+                            .w(px(12.0))
+                            .child(
+                                Scrollbar::vertical(&self.transfer_queue_scroll)
+                                    .mode(ScrollbarMode::Always)
+                                    .viewport_from_layout(),
+                            ),
+                    ),
+            )
             .into_any_element()
     }
 

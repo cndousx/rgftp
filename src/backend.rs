@@ -280,17 +280,31 @@ impl SftpWorker {
                                 remote,
                                 display_name,
                             } => {
+                                let id = next_transfer_id;
+                                next_transfer_id += 1;
+
                                 let Some(active) = clients.get(&session_id) else {
                                     let _ = events
-                                        .send(BackendEvent::Error {
-                                            message: "尚未连接服务器".to_string(),
+                                        .send(BackendEvent::TransferStarted {
+                                            id,
+                                            name: display_name.clone(),
+                                            direction: Direction::Upload,
+                                            total: 0,
                                         })
                                         .await;
+                                    emit_transfer_done(
+                                        &events,
+                                        session_id,
+                                        id,
+                                        display_name,
+                                        Direction::Upload,
+                                        Err("尚未连接服务器".to_string()),
+                                        false,
+                                    )
+                                    .await;
                                     continue;
                                 };
 
-                                let id = next_transfer_id;
-                                next_transfer_id += 1;
                                 worker_cancel.store(false, Ordering::SeqCst);
 
                                 let _ = events
@@ -358,17 +372,31 @@ impl SftpWorker {
                                 local,
                                 display_name,
                             } => {
+                                let id = next_transfer_id;
+                                next_transfer_id += 1;
+
                                 let Some(active) = clients.get(&session_id) else {
                                     let _ = events
-                                        .send(BackendEvent::Error {
-                                            message: "尚未连接服务器".to_string(),
+                                        .send(BackendEvent::TransferStarted {
+                                            id,
+                                            name: display_name.clone(),
+                                            direction: Direction::Download,
+                                            total: 0,
                                         })
                                         .await;
+                                    emit_transfer_done(
+                                        &events,
+                                        session_id,
+                                        id,
+                                        display_name,
+                                        Direction::Download,
+                                        Err("尚未连接服务器".to_string()),
+                                        false,
+                                    )
+                                    .await;
                                     continue;
                                 };
 
-                                let id = next_transfer_id;
-                                next_transfer_id += 1;
                                 worker_cancel.store(false, Ordering::SeqCst);
 
                                 let _ = events
