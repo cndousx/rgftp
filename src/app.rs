@@ -348,6 +348,11 @@ pub struct RgFtpApp {
     sessions: HashMap<String, SessionState>,
     active_session: Option<String>,
     connecting: HashSet<String>,
+    /// Sessions the user asked to disconnect, so the matching `Disconnected`
+    /// event is not mistaken for a server-side failure.
+    disconnecting: HashSet<String>,
+    /// Unexpected disconnects, keyed by profile id, shown on the sidebar row.
+    disconnected_notices: HashMap<String, SharedString>,
     dialog: DialogState,
     transfer: Option<TransferView>,
     transfer_queue: VecDeque<QueuedTransfer>,
@@ -421,6 +426,8 @@ impl RgFtpApp {
             sessions: HashMap::new(),
             active_session: None,
             connecting: HashSet::new(),
+            disconnecting: HashSet::new(),
+            disconnected_notices: HashMap::new(),
             dialog: DialogState::None,
             transfer: None,
             transfer_queue: VecDeque::new(),
@@ -489,6 +496,8 @@ impl RgFtpApp {
                     return;
                 };
                 self.connecting.remove(&profile_id);
+                self.disconnecting.remove(&profile_id);
+                self.disconnected_notices.remove(&profile_id);
                 self.sessions.insert(
                     profile_id.clone(),
                     SessionState {
@@ -521,6 +530,7 @@ impl RgFtpApp {
                     .map(|profile| profile.name.clone())
                     .unwrap_or_else(|| "服务器".to_string());
                 self.connecting.remove(&profile_id);
+                self.disconnecting.remove(&profile_id);
                 let was_active = self.active_session.as_deref() == Some(profile_id.as_str());
                 self.sessions.remove(&profile_id);
                 if was_active {
@@ -604,6 +614,7 @@ impl RgFtpApp {
                 session_id,
                 message,
             } => {
+                let user_requested = self.disconnecting.remove(&session_id);
                 self.connecting.remove(&session_id);
                 let was_active = self.active_session.as_deref() == Some(session_id.as_str());
                 let removed = self.sessions.remove(&session_id);
@@ -613,17 +624,27 @@ impl RgFtpApp {
 
                 if let Some(session) = removed {
                     let name = session.info.name;
-                    if let Some(active_id) = self.active_session.clone() {
+                    let summary = if let Some(active_id) = self.active_session.clone() {
                         let active_name = self
                             .sessions
                             .get(&active_id)
                             .map(|session| session.info.name.clone())
                             .unwrap_or_default();
-                        self.status = format!("{message}：{name}，当前连接 {active_name}").into();
+                        format!("{message}：{name}，当前连接 {active_name}")
                     } else {
-                        self.status = format!("{message}：{name}").into();
+                        format!("{message}：{name}")
+                    };
+                    self.status = summary.clone().into();
+                    if user_requested {
+                        self.status_kind = StatusKind::Info;
+                    } else {
+                        // The remote side went away on its own: leave a hint on
+                        // the sidebar row until the user reconnects.
+                        self.status_kind = StatusKind::Error;
+                        self.disconnected_notices
+                            .insert(session_id.clone(), message.clone().into());
+                        self.push_toast(ToastKind::Error, summary, cx);
                     }
-                    self.status_kind = StatusKind::Info;
                 } else if was_active {
                     self.status = message.into();
                     self.status_kind = StatusKind::Info;
@@ -1119,6 +1140,8 @@ impl RgFtpApp {
 
         let was_active = self.active_session.as_deref() == Some(profile_id);
         self.connecting.insert(profile_id.to_string());
+        self.disconnecting.remove(profile_id);
+        self.disconnected_notices.remove(profile_id);
         self.sessions.remove(profile_id);
         if was_active {
             self.select_fallback_session();
@@ -1159,6 +1182,7 @@ impl RgFtpApp {
             return;
         }
         self.connecting.remove(session_id);
+        self.disconnecting.insert(session_id.to_string());
         let name = self
             .sessions
             .get(session_id)
@@ -2162,6 +2186,8 @@ impl RgFtpApp {
                 }
                 self.sessions.remove(&id);
                 self.connecting.remove(&id);
+                self.disconnecting.remove(&id);
+                self.disconnected_notices.remove(&id);
                 if was_active {
                     self.select_fallback_session();
                 }
@@ -3419,6 +3445,12 @@ impl RgFtpApp {
         let mono = cx.theme().mono_font_family.clone();
         let connected = self.active_session_state().is_some();
         let transferring = self.is_transferring();
+        // A server-side disconnect leaves no active session behind. Show the
+        // hint next to the remote pane title so it stays visible without
+        // cluttering the sidebar.
+        let server_disconnected = self.active_session.is_none()
+            && self.connecting.is_empty()
+            && !self.disconnected_notices.is_empty();
 
         let mut title = h_flex()
             .gap_2()
@@ -3434,7 +3466,23 @@ impl RgFtpApp {
                                 colors.muted_foreground
                             }),
                     )
-                    .child(div().text_sm().font_semibold().child("远程服务器")),
+                    .child(div().text_sm().font_semibold().child("远程服务器"))
+                    .when(server_disconnected, |this| {
+                        this.child(
+                            div()
+                                .id("remote-server-disconnected")
+                                .flex()
+                                .items_center()
+                                .tooltip(|window, cx| {
+                                    Tooltip::new("服务端已断开连接").build(window, cx)
+                                })
+                                .child(
+                                    Icon::new(IconName::ServerOff)
+                                        .xsmall()
+                                        .text_color(colors.danger),
+                                ),
+                        )
+                    }),
             )
             .child(div().flex_1());
 

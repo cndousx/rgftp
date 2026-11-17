@@ -228,7 +228,40 @@ impl SftpWorker {
                         });
                     }
 
-                    while let Some(command) = rx.recv().await {
+                    // Poll the SSH handles so a server-side disconnect is
+                    // noticed even while the command queue is idle. Ticks are
+                    // skipped while a command (e.g. a large transfer) is
+                    // running; the failed command reports the error instead.
+                    let mut health_check = tokio::time::interval(std::time::Duration::from_secs(2));
+                    health_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+                    loop {
+                        let command = tokio::select! {
+                            command = rx.recv() => {
+                                let Some(command) = command else {
+                                    break;
+                                };
+                                command
+                            }
+                            _ = health_check.tick() => {
+                                let disconnected: Vec<String> = clients
+                                    .iter()
+                                    .filter(|(_, client)| client.session.is_closed())
+                                    .map(|(session_id, _)| session_id.clone())
+                                    .collect();
+                                for session_id in disconnected {
+                                    clients.remove(&session_id);
+                                    let _ = events
+                                        .send(BackendEvent::Disconnected {
+                                            session_id,
+                                            message: "服务端已断开连接".to_string(),
+                                        })
+                                        .await;
+                                }
+                                continue;
+                            }
+                        };
+
                         match command {
                             BackendCommand::Connect { profile } => {
                                 clients.remove(&profile.id);
@@ -701,7 +734,7 @@ impl RemoteFileInfo {
 struct Client {
     // Dropped before the SSH session so the SFTP channel shuts down first.
     sftp: SftpSession,
-    _session: russh::client::Handle<ClientHandler>,
+    session: russh::client::Handle<ClientHandler>,
 }
 struct ClientHandler {
     profile_id: String,
@@ -815,7 +848,13 @@ async fn connect_client(
     profile: &ConnectionProfile,
     handler: ClientHandler,
 ) -> Result<Client, String> {
-    let config = Arc::new(russh::client::Config::default());
+    let config = Arc::new(russh::client::Config {
+        // Detect half-open connections too: without keepalives a dropped
+        // network path can go unnoticed until the next SFTP request.
+        keepalive_interval: Some(std::time::Duration::from_secs(30)),
+        keepalive_max: 3,
+        ..Default::default()
+    });
     let mut session =
         russh::client::connect(config, (profile.host.as_str(), profile.port), handler)
             .await
@@ -865,10 +904,7 @@ async fn connect_client(
         .await
         .map_err(|error| format!("初始化 SFTP 会话失败：{error}"))?;
 
-    Ok(Client {
-        sftp,
-        _session: session,
-    })
+    Ok(Client { sftp, session })
 }
 
 async fn list_dir(sftp: &SftpSession, path: &str) -> Result<(String, Vec<FileEntry>), String> {
