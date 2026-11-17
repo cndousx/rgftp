@@ -117,6 +117,9 @@ struct SessionState {
 }
 
 struct TransferView {
+    /// The session (server) this transfer belongs to. The progress row is only
+    /// shown while that session is active.
+    session_id: String,
     id: u64,
     name: String,
     direction: Direction,
@@ -133,8 +136,9 @@ struct TransferView {
 }
 
 impl TransferView {
-    fn new(id: u64, name: String, direction: Direction, total: u64) -> Self {
+    fn new(session_id: String, id: u64, name: String, direction: Direction, total: u64) -> Self {
         Self {
+            session_id,
             id,
             name,
             direction,
@@ -273,6 +277,12 @@ enum TransferRequest {
 }
 
 impl TransferRequest {
+    fn session_id(&self) -> &str {
+        match self {
+            Self::Upload { session_id, .. } | Self::Download { session_id, .. } => session_id,
+        }
+    }
+
     fn direction(&self) -> Direction {
         match self {
             Self::Upload { .. } => Direction::Upload,
@@ -475,6 +485,23 @@ impl RgFtpApp {
 
         app.load_local_dir(local_path, cx);
 
+        // Keep the window open while any upload or download is in flight, so
+        // the user cannot accidentally kill the transfer by closing the window.
+        let weak_app = cx.weak_entity();
+        window.on_window_should_close(cx, move |_, cx| {
+            let Ok(allowed) = weak_app.update(cx, |app, cx| {
+                if app.has_transfer_tasks() {
+                    app.push_toast(ToastKind::Error, "传输进行中，暂时无法关闭窗口", cx);
+                    false
+                } else {
+                    true
+                }
+            }) else {
+                return true;
+            };
+            allowed
+        });
+
         app._event_task = cx.spawn(async move |this, cx| {
             while let Ok(event) = event_rx.recv().await {
                 if this
@@ -651,12 +678,19 @@ impl RgFtpApp {
                 }
             }
             BackendEvent::TransferStarted {
+                session_id,
                 id,
                 name,
                 direction,
                 total,
             } => {
-                self.transfer = Some(TransferView::new(id, name.clone(), direction, total));
+                self.transfer = Some(TransferView::new(
+                    session_id,
+                    id,
+                    name.clone(),
+                    direction,
+                    total,
+                ));
                 self.status = format!("{} {}", direction.label(), name).into();
                 self.status_kind = StatusKind::Info;
             }
@@ -868,8 +902,26 @@ impl RgFtpApp {
             .into_any_element()
     }
 
-    /// Whether a transfer is running or more are waiting in the queue.
-    fn is_transferring(&self) -> bool {
+    /// Whether `session_id` has a running transfer or tasks waiting in the queue.
+    fn session_is_transferring(&self, session_id: &str) -> bool {
+        self.transfer
+            .as_ref()
+            .is_some_and(|transfer| transfer.session_id == session_id)
+            || self
+                .transfer_queue
+                .iter()
+                .any(|queued| queued.request.session_id() == session_id)
+    }
+
+    /// Whether the active session has a transfer running or queued.
+    fn active_session_is_transferring(&self) -> bool {
+        self.active_session
+            .as_deref()
+            .is_some_and(|session_id| self.session_is_transferring(session_id))
+    }
+
+    /// Whether any transfer is running or waiting, across every session.
+    fn has_transfer_tasks(&self) -> bool {
         self.transfer.is_some() || !self.transfer_queue.is_empty()
     }
 
@@ -1197,15 +1249,16 @@ impl RgFtpApp {
     }
 
     fn disconnect(&mut self, cx: &mut Context<Self>) {
-        if self.is_transferring() {
+        let Some(session_id) = self.active_session.clone() else {
+            return;
+        };
+        if self.session_is_transferring(&session_id) {
             self.status = "传输进行中，无法断开连接".into();
             self.status_kind = StatusKind::Error;
             cx.notify();
             return;
         }
-        if let Some(session_id) = self.active_session.clone() {
-            self.disconnect_session(&session_id, cx);
-        }
+        self.disconnect_session(&session_id, cx);
     }
 
     fn cancel_current_transfer(&mut self, cx: &mut Context<Self>) {
@@ -1264,9 +1317,10 @@ impl RgFtpApp {
     fn start_transfer(&mut self, request: TransferRequest, cx: &mut Context<Self>) {
         let direction = request.direction();
         let name = request.name().to_string();
+        let session_id = request.session_id().to_string();
         // The backend assigns the real transfer id with `TransferStarted`; the
         // placeholder lets the progress row appear before that event arrives.
-        self.transfer = Some(TransferView::new(0, name.clone(), direction, 0));
+        self.transfer = Some(TransferView::new(session_id, 0, name.clone(), direction, 0));
         self.status = format!("{} {}", direction.label(), name).into();
         self.status_kind = StatusKind::Info;
 
@@ -2334,6 +2388,10 @@ impl RgFtpApp {
         } else {
             colors.muted_foreground
         };
+        // Native platforms ask the window whether it may close, but the custom
+        // title bar on other platforms removes the window directly.
+        let can_close = !self.has_transfer_tasks();
+        let close_view = cx.weak_entity();
 
         let control_button =
             |id: &'static str, icon: IconName, area: WindowControlArea, close: bool| {
@@ -2363,12 +2421,25 @@ impl RgFtpApp {
                     .window_control_area(area)
                     .hover(move |this| this.bg(hover_bg).text_color(hover_fg))
                     .when(!cfg!(target_os = "windows"), |this| {
+                        let close_view = close_view.clone();
                         this.on_click(move |_, window, cx| {
                             cx.stop_propagation();
                             match area {
                                 WindowControlArea::Min => window.minimize_window(),
                                 WindowControlArea::Max => window.zoom_window(),
-                                WindowControlArea::Close => window.remove_window(),
+                                WindowControlArea::Close => {
+                                    if can_close {
+                                        window.remove_window();
+                                    } else {
+                                        let _ = close_view.update(cx, |app, cx| {
+                                            app.push_toast(
+                                                ToastKind::Error,
+                                                "传输进行中，暂时无法关闭窗口",
+                                                cx,
+                                            );
+                                        });
+                                    }
+                                }
                                 WindowControlArea::Drag => {}
                             }
                         })
@@ -2506,7 +2577,7 @@ impl RgFtpApp {
             })
             .collect();
 
-        let total_connections = self.settings.connections.len();
+        let _total_connections = self.settings.connections.len();
         let sidebar_drop_active = cx.has_active_drag();
 
         let mut list = v_flex().gap_2();
@@ -2752,6 +2823,7 @@ impl RgFtpApp {
                 let active = self.active_session.as_deref() == Some(connection.id.as_str());
                 let connected = self.sessions.contains_key(&connection.id);
                 let connecting = self.connecting.contains(&connection.id);
+                let transfer_active = self.session_is_transferring(&connection.id);
                 let connection_drop_before = sidebar_drop_active
                     && match self.sidebar_drop_target.as_ref() {
                         Some(SidebarDropTarget::Connection { id, before: true }) => {
@@ -2821,6 +2893,23 @@ impl RgFtpApp {
                                     .child(connection.host.clone()),
                             ),
                     )
+                    .when(transfer_active, |this| {
+                        this.child(
+                            div()
+                                .id(ElementId::Name(
+                                    format!("connection-transfer-{}", connection.id).into(),
+                                ))
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .tooltip(|window, cx| Tooltip::new("有传输任务").build(window, cx))
+                                .child(
+                                    Icon::new(IconName::ArrowUpDown)
+                                        .xsmall()
+                                        .text_color(colors.primary),
+                                ),
+                        )
+                    })
                     .when(connected, |this| {
                         this.child(
                             div()
@@ -3043,12 +3132,6 @@ impl RgFtpApp {
                         div()
                             .text_xs()
                             .text_color(colors.muted_foreground)
-                            .child(format!("{total_connections} 个连接")),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(colors.muted_foreground)
                             .child("拖拽文件到另一侧即可传输"),
                     )
                     .child(
@@ -3104,7 +3187,7 @@ impl RgFtpApp {
             .and_then(|id| self.settings.connection(id))
             .map(|profile| profile.name.clone());
 
-        let transferring = self.is_transferring();
+        let transferring = self.active_session_is_transferring();
 
         if let Some(session) = self.active_session_state() {
             let connected = session.info.clone();
@@ -3444,7 +3527,7 @@ impl RgFtpApp {
         let colors = cx.theme().colors;
         let mono = cx.theme().mono_font_family.clone();
         let connected = self.active_session_state().is_some();
-        let transferring = self.is_transferring();
+        let transferring = self.active_session_is_transferring();
         // A server-side disconnect leaves no active session behind. Show the
         // hint next to the remote pane title so it stays visible without
         // cluttering the sidebar.
@@ -3801,16 +3884,21 @@ impl RgFtpApp {
             rgb(0xf8f8f8).into()
         };
 
+        let active_transfer = self.transfer.as_ref().filter(|transfer| {
+            self.active_session.as_deref() == Some(transfer.session_id.as_str())
+        });
+        let queued = self.active_transfer_queue();
+
         v_flex()
             .flex_shrink_0()
             .border_t_1()
             .border_color(colors.status_bar_border)
             .bg(status_bg)
-            .when_some(self.transfer.as_ref(), |this, transfer| {
+            .when_some(active_transfer, |this, transfer| {
                 this.child(self.render_transfer_row(transfer, cx))
             })
-            .when(!self.transfer_queue.is_empty(), |this| {
-                this.child(self.render_transfer_queue(cx))
+            .when(!queued.is_empty(), |this| {
+                this.child(self.render_transfer_queue(queued, cx))
             })
             .into_any_element()
     }
@@ -3920,11 +4008,27 @@ impl RgFtpApp {
             .into_any_element()
     }
 
+    /// Queued transfers that belong to the session currently shown, so one
+    /// server never shows another server's waiting tasks.
+    fn active_transfer_queue(&self) -> Vec<QueuedTransfer> {
+        let Some(active_id) = self.active_session.as_deref() else {
+            return Vec::new();
+        };
+        self.transfer_queue
+            .iter()
+            .filter(|queued| queued.request.session_id() == active_id)
+            .cloned()
+            .collect()
+    }
+
     /// Lists the transfers waiting behind the active one. At most three rows
     /// are visible; more than that scrolls.
-    fn render_transfer_queue(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_transfer_queue(
+        &self,
+        items: Vec<QueuedTransfer>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let colors = cx.theme().colors;
-        let items: Vec<QueuedTransfer> = self.transfer_queue.iter().cloned().collect();
         let count = items.len();
         let visible_rows = count.min(3);
         let row_height = 30.0_f32;
@@ -4269,7 +4373,7 @@ impl RgFtpApp {
                             }),
                         ));
                     }
-                    if self.is_transferring() {
+                    if self.session_is_transferring(id) {
                         items.push(context_menu_item_disabled(
                             "ctx-connection-disconnect",
                             IconName::Unplug,

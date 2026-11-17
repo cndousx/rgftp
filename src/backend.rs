@@ -63,6 +63,7 @@ pub enum BackendEvent {
         message: String,
     },
     TransferStarted {
+        session_id: String,
         id: u64,
         name: String,
         direction: Direction,
@@ -203,7 +204,7 @@ impl SftpWorker {
                 };
 
                 runtime.block_on(async move {
-                    let mut clients: HashMap<String, Client> = HashMap::new();
+                    let mut clients: HashMap<String, Arc<Client>> = HashMap::new();
                     let mut next_transfer_id = 1u64;
                     let mut next_host_key_request = 1u64;
                     // Pending host-key prompts, keyed by request id. UI answers
@@ -336,7 +337,7 @@ impl SftpWorker {
                                             }
                                         }
 
-                                        clients.insert(profile.id.clone(), new_client);
+                                        clients.insert(profile.id.clone(), Arc::new(new_client));
                                     }
                                     Err(error) => {
                                         let _ = events
@@ -393,6 +394,7 @@ impl SftpWorker {
                                 let Some(active) = clients.get(&session_id) else {
                                     let _ = events
                                         .send(BackendEvent::TransferStarted {
+                                            session_id: session_id.clone(),
                                             id,
                                             name: display_name.clone(),
                                             direction: Direction::Upload,
@@ -411,67 +413,78 @@ impl SftpWorker {
                                     .await;
                                     continue;
                                 };
+                                let active = Arc::clone(active);
 
                                 worker_cancel.store(false, Ordering::SeqCst);
 
-                                let _ = events
-                                    .send(BackendEvent::TransferStarted {
+                                // Transfers run on their own task so the command
+                                // loop keeps serving other sessions. Without this
+                                // a large upload to one server would block lists and
+                                // disconnects for every other server.
+                                let events = events.clone();
+                                let worker_cancel = Arc::clone(&worker_cancel);
+                                tokio::spawn(async move {
+                                    let _ = events
+                                        .send(BackendEvent::TransferStarted {
+                                            session_id: session_id.clone(),
+                                            id,
+                                            name: display_name.clone(),
+                                            direction: Direction::Upload,
+                                            total: 0,
+                                        })
+                                        .await;
+
+                                    let Some(total) = local_total(&local, &worker_cancel) else {
+                                        emit_transfer_done(
+                                            &events,
+                                            session_id,
+                                            id,
+                                            display_name,
+                                            Direction::Upload,
+                                            Err("已取消".to_string()),
+                                            true,
+                                        )
+                                        .await;
+                                        worker_cancel.store(false, Ordering::SeqCst);
+                                        return;
+                                    };
+
+                                    let _ = events
+                                        .send(BackendEvent::TransferTotal { id, total })
+                                        .await;
+
+                                    let mut transferred = 0u64;
+                                    let mut last_emit = 0u64;
+                                    let result = upload_path(
+                                        &active.sftp,
+                                        &local,
+                                        &remote,
+                                        &events,
                                         id,
-                                        name: display_name.clone(),
-                                        direction: Direction::Upload,
-                                        total: 0,
-                                    })
+                                        &mut transferred,
+                                        &mut last_emit,
+                                        &worker_cancel,
+                                    )
                                     .await;
 
-                                let Some(total) = local_total(&local, &worker_cancel) else {
+                                    let _ = events
+                                        .send(BackendEvent::TransferProgress { id, transferred })
+                                        .await;
+
+                                    let cancelled =
+                                        result.is_err() && worker_cancel.load(Ordering::SeqCst);
                                     emit_transfer_done(
                                         &events,
                                         session_id,
                                         id,
                                         display_name,
                                         Direction::Upload,
-                                        Err("已取消".to_string()),
-                                        true,
+                                        result,
+                                        cancelled,
                                     )
                                     .await;
                                     worker_cancel.store(false, Ordering::SeqCst);
-                                    continue;
-                                };
-
-                                let _ =
-                                    events.send(BackendEvent::TransferTotal { id, total }).await;
-
-                                let mut transferred = 0u64;
-                                let mut last_emit = 0u64;
-                                let result = upload_path(
-                                    &active.sftp,
-                                    &local,
-                                    &remote,
-                                    &events,
-                                    id,
-                                    &mut transferred,
-                                    &mut last_emit,
-                                    &worker_cancel,
-                                )
-                                .await;
-
-                                let _ = events
-                                    .send(BackendEvent::TransferProgress { id, transferred })
-                                    .await;
-
-                                let cancelled =
-                                    result.is_err() && worker_cancel.load(Ordering::SeqCst);
-                                emit_transfer_done(
-                                    &events,
-                                    session_id,
-                                    id,
-                                    display_name,
-                                    Direction::Upload,
-                                    result,
-                                    cancelled,
-                                )
-                                .await;
-                                worker_cancel.store(false, Ordering::SeqCst);
+                                });
                             }
                             BackendCommand::Download {
                                 session_id,
@@ -485,6 +498,7 @@ impl SftpWorker {
                                 let Some(active) = clients.get(&session_id) else {
                                     let _ = events
                                         .send(BackendEvent::TransferStarted {
+                                            session_id: session_id.clone(),
                                             id,
                                             name: display_name.clone(),
                                             direction: Direction::Download,
@@ -503,69 +517,76 @@ impl SftpWorker {
                                     .await;
                                     continue;
                                 };
+                                let active = Arc::clone(active);
 
                                 worker_cancel.store(false, Ordering::SeqCst);
 
-                                let _ = events
-                                    .send(BackendEvent::TransferStarted {
+                                let events = events.clone();
+                                let worker_cancel = Arc::clone(&worker_cancel);
+                                tokio::spawn(async move {
+                                    let _ = events
+                                        .send(BackendEvent::TransferStarted {
+                                            session_id: session_id.clone(),
+                                            id,
+                                            name: display_name.clone(),
+                                            direction: Direction::Download,
+                                            total: 0,
+                                        })
+                                        .await;
+
+                                    let Some(total) =
+                                        remote_total(&active.sftp, &remote, &worker_cancel).await
+                                    else {
+                                        emit_transfer_done(
+                                            &events,
+                                            session_id,
+                                            id,
+                                            display_name,
+                                            Direction::Download,
+                                            Err("已取消".to_string()),
+                                            true,
+                                        )
+                                        .await;
+                                        worker_cancel.store(false, Ordering::SeqCst);
+                                        return;
+                                    };
+
+                                    let _ = events
+                                        .send(BackendEvent::TransferTotal { id, total })
+                                        .await;
+
+                                    let mut transferred = 0u64;
+                                    let mut last_emit = 0u64;
+                                    let result = download_path(
+                                        &active.sftp,
+                                        &remote,
+                                        &local,
+                                        &events,
                                         id,
-                                        name: display_name.clone(),
-                                        direction: Direction::Download,
-                                        total: 0,
-                                    })
+                                        &mut transferred,
+                                        &mut last_emit,
+                                        &worker_cancel,
+                                    )
                                     .await;
 
-                                let Some(total) =
-                                    remote_total(&active.sftp, &remote, &worker_cancel).await
-                                else {
+                                    let _ = events
+                                        .send(BackendEvent::TransferProgress { id, transferred })
+                                        .await;
+
+                                    let cancelled =
+                                        result.is_err() && worker_cancel.load(Ordering::SeqCst);
                                     emit_transfer_done(
                                         &events,
                                         session_id,
                                         id,
                                         display_name,
                                         Direction::Download,
-                                        Err("已取消".to_string()),
-                                        true,
+                                        result,
+                                        cancelled,
                                     )
                                     .await;
                                     worker_cancel.store(false, Ordering::SeqCst);
-                                    continue;
-                                };
-
-                                let _ =
-                                    events.send(BackendEvent::TransferTotal { id, total }).await;
-
-                                let mut transferred = 0u64;
-                                let mut last_emit = 0u64;
-                                let result = download_path(
-                                    &active.sftp,
-                                    &remote,
-                                    &local,
-                                    &events,
-                                    id,
-                                    &mut transferred,
-                                    &mut last_emit,
-                                    &worker_cancel,
-                                )
-                                .await;
-
-                                let _ = events
-                                    .send(BackendEvent::TransferProgress { id, transferred })
-                                    .await;
-
-                                let cancelled =
-                                    result.is_err() && worker_cancel.load(Ordering::SeqCst);
-                                emit_transfer_done(
-                                    &events,
-                                    session_id,
-                                    id,
-                                    display_name,
-                                    Direction::Download,
-                                    result,
-                                    cancelled,
-                                )
-                                .await;
-                                worker_cancel.store(false, Ordering::SeqCst);
+                                });
                             }
                             BackendCommand::Disconnect { session_id } => {
                                 let had_client = clients.remove(&session_id).is_some();
