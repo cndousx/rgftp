@@ -1,4 +1,6 @@
-use crate::backend::{BackendCommand, BackendEvent, Direction, RemoteFileInfo, SftpWorker};
+use crate::backend::{
+    BackendCommand, BackendEvent, Direction, HostKeyDecision, RemoteFileInfo, SftpWorker,
+};
 use crate::model::{
     AuthMethod, ConnectionProfile, FileEntry, Settings, ThemePreference, new_id, sort_entries,
 };
@@ -233,6 +235,18 @@ struct FileInfoForm {
     error: Option<String>,
 }
 
+/// A pending "do you trust this server key?" question from the backend.
+struct HostKeyPrompt {
+    profile_id: String,
+    request_id: u64,
+    host: String,
+    port: u16,
+    key_type: String,
+    fingerprint: String,
+    /// Set when a previously trusted key for this host no longer matches.
+    previous_fingerprint: Option<String>,
+}
+
 #[derive(Clone)]
 struct QueuedUpload {
     session_id: String,
@@ -315,6 +329,7 @@ enum DialogState {
     Rename(RenameForm),
     Chmod(ChmodForm),
     FileInfo(FileInfoForm),
+    HostKey(HostKeyPrompt),
     Confirm(ConfirmDialog),
 }
 
@@ -511,13 +526,42 @@ impl RgFtpApp {
                 if was_active {
                     self.select_fallback_session();
                 }
-                self.status = format!("连接 {profile_name} 失败：{error}").into();
-                self.status_kind = StatusKind::Error;
-                self.push_toast(
-                    ToastKind::Error,
-                    format!("连接 {profile_name} 失败：{error}"),
-                    cx,
-                );
+                let host_key_rejected = error.contains("未信任服务器主机密钥");
+                if host_key_rejected {
+                    // The user already saw and dismissed the key prompt; do not
+                    // report their deliberate cancellation as a failure.
+                    self.status = format!("已取消连接 {profile_name}").into();
+                    self.status_kind = StatusKind::Info;
+                } else {
+                    self.status = format!("连接 {profile_name} 失败：{error}").into();
+                    self.status_kind = StatusKind::Error;
+                    self.push_toast(
+                        ToastKind::Error,
+                        format!("连接 {profile_name} 失败：{error}"),
+                        cx,
+                    );
+                }
+            }
+            BackendEvent::HostKeyVerification {
+                profile_id,
+                request_id,
+                host,
+                port,
+                key_type,
+                fingerprint,
+                previous_fingerprint,
+            } => {
+                self.dialog = DialogState::HostKey(HostKeyPrompt {
+                    profile_id,
+                    request_id,
+                    host: host.clone(),
+                    port,
+                    key_type,
+                    fingerprint,
+                    previous_fingerprint,
+                });
+                self.status = format!("等待确认主机密钥：{host}:{port}").into();
+                self.status_kind = StatusKind::Info;
             }
             BackendEvent::Listed {
                 session_id,
@@ -1085,6 +1129,31 @@ impl RgFtpApp {
         cx.notify();
     }
 
+    /// Accepts the key from a pending host-key prompt and resumes connecting.
+    fn trust_host_key(&mut self, request_id: u64, remember: bool, cx: &mut Context<Self>) {
+        self.worker
+            .respond_host_key(request_id, HostKeyDecision::Trust { remember });
+        self.dialog = DialogState::None;
+        self.status = if remember {
+            "已信任服务器主机密钥，正在连接..."
+        } else {
+            "已临时信任服务器主机密钥（仅本次连接）"
+        }
+        .into();
+        self.status_kind = StatusKind::Info;
+        cx.notify();
+    }
+
+    /// Rejects the key from a pending host-key prompt and aborts connecting.
+    fn reject_host_key(&mut self, request_id: u64, cx: &mut Context<Self>) {
+        self.worker
+            .respond_host_key(request_id, HostKeyDecision::Reject);
+        self.dialog = DialogState::None;
+        self.status = "已取消连接：未信任服务器主机密钥".into();
+        self.status_kind = StatusKind::Info;
+        cx.notify();
+    }
+
     fn disconnect_session(&mut self, session_id: &str, cx: &mut Context<Self>) {
         if !self.sessions.contains_key(session_id) {
             return;
@@ -1446,6 +1515,19 @@ impl RgFtpApp {
     }
 
     fn close_dialog(&mut self, cx: &mut Context<Self>) {
+        // Dismissing the host-key prompt rejects the key, so the pending SSH
+        // handshake is always answered instead of hanging forever.
+        if let DialogState::HostKey(prompt) = &self.dialog {
+            let request_id = prompt.request_id;
+            self.worker
+                .respond_host_key(request_id, HostKeyDecision::Reject);
+            self.dialog = DialogState::None;
+            self.status = "已取消连接：未信任服务器主机密钥".into();
+            self.status_kind = StatusKind::Info;
+            cx.notify();
+            return;
+        }
+
         // Dismissing an overwrite prompt skips that file and moves on to the
         // next conflicting upload, if any.
         if matches!(
@@ -4298,6 +4380,7 @@ impl RgFtpApp {
             DialogState::Rename(form) => Some(self.render_rename_dialog(form, cx)),
             DialogState::Chmod(form) => Some(self.render_chmod_dialog(form, cx)),
             DialogState::FileInfo(form) => Some(self.render_file_info_dialog(form, cx)),
+            DialogState::HostKey(prompt) => Some(self.render_host_key_dialog(prompt, cx)),
             DialogState::Confirm(confirm) => Some(self.render_confirm_dialog(confirm, cx)),
         }
     }
@@ -4910,6 +4993,170 @@ impl RgFtpApp {
             },
             Some("在连接管理器中整理服务器"),
             IconName::FolderPlus,
+            body.into_any_element(),
+            footer,
+            cx,
+        )
+    }
+
+    fn render_host_key_dialog(&self, prompt: &HostKeyPrompt, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors;
+        let mono = cx.theme().mono_font_family.clone();
+        let changed = prompt.previous_fingerprint.is_some();
+        let endpoint = format!("{}:{}", prompt.host, prompt.port);
+        let profile_name = self
+            .settings
+            .connection(&prompt.profile_id)
+            .map(|profile| profile.name.clone())
+            .unwrap_or_else(|| endpoint.clone());
+
+        let message = if changed {
+            format!(
+                "「{profile_name}」（{endpoint}）提供的服务器主机密钥与上次保存的不一致。\
+                 这可能是服务器重装了系统或更换了密钥，也可能是中间人攻击。\
+                 请与服务器管理员确认新的指纹后再决定是否继续。"
+            )
+        } else {
+            format!(
+                "第一次连接到「{profile_name}」（{endpoint}），无法自动确认服务器身份。\
+                 请核对下面的主机密钥指纹，只有确认它属于该服务器时才应继续。"
+            )
+        };
+
+        let banner = h_flex()
+            .gap_2()
+            .items_center()
+            .p_3()
+            .rounded_md()
+            .bg(if changed {
+                colors.danger.opacity(0.1)
+            } else {
+                colors.primary.opacity(0.08)
+            })
+            .child(
+                div().flex_shrink_0().child(
+                    Icon::new(if changed {
+                        IconName::TriangleAlert
+                    } else {
+                        IconName::Shield
+                    })
+                    .small()
+                    .text_color(if changed {
+                        colors.danger
+                    } else {
+                        colors.primary
+                    }),
+                ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_sm()
+                    .text_color(colors.foreground)
+                    .child(message),
+            );
+
+        let mut body = v_flex()
+            .gap_3()
+            .p_5()
+            .child(banner)
+            .child(info_row(
+                "主机",
+                format!("{}:{}", prompt.host, prompt.port),
+                false,
+                colors,
+                &mono,
+            ))
+            .child(info_row(
+                "密钥类型",
+                prompt.key_type.clone(),
+                false,
+                colors,
+                &mono,
+            ))
+            .child(info_row(
+                "SHA256 指纹",
+                prompt.fingerprint.clone(),
+                true,
+                colors,
+                &mono,
+            ));
+
+        if let Some(previous) = &prompt.previous_fingerprint {
+            body = body.child(info_row(
+                "已保存指纹",
+                previous.clone(),
+                true,
+                colors,
+                &mono,
+            ));
+        }
+
+        body = body.child(
+            div()
+                .text_xs()
+                .text_color(colors.muted_foreground)
+                .child("选择“信任并保存”后，下次连接该服务器将不再询问。"),
+        );
+
+        let request_id = prompt.request_id;
+        let reject_id = request_id;
+        let once_id = request_id;
+        let remember_id = request_id;
+        let footer = h_flex()
+            .gap_2()
+            .child(
+                Button::new("host-key-cancel")
+                    .ghost()
+                    .small()
+                    .label("取消连接")
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.reject_host_key(reject_id, cx)),
+                    ),
+            )
+            .child(
+                Button::new("host-key-once")
+                    .secondary()
+                    .small()
+                    .label("仅本次")
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.trust_host_key(once_id, false, cx)),
+                    ),
+            )
+            .child(
+                Button::new("host-key-save")
+                    .when(changed, |button| button.danger())
+                    .when(!changed, |button| button.primary())
+                    .small()
+                    .icon(if changed {
+                        IconName::TriangleAlert
+                    } else {
+                        IconName::Shield
+                    })
+                    .label(if changed {
+                        "仍然信任并保存"
+                    } else {
+                        "信任并保存"
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.trust_host_key(remember_id, true, cx)
+                    })),
+            )
+            .into_any_element();
+
+        self.render_dialog_shell(
+            if changed {
+                "主机密钥已更改"
+            } else {
+                "未知的主机密钥"
+            },
+            Some("请核对服务器指纹后再继续连接"),
+            if changed {
+                IconName::TriangleAlert
+            } else {
+                IconName::Shield
+            },
             body.into_any_element(),
             footer,
             cx,

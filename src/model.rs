@@ -279,11 +279,89 @@ impl Settings {
 }
 
 pub fn config_path() -> PathBuf {
+    config_dir().join("profiles.json")
+}
+
+fn config_dir() -> PathBuf {
     dirs::config_dir()
         .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("."))
         .join("rgftp")
-        .join("profiles.json")
+}
+
+/// A server host key the user has explicitly trusted.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KnownHost {
+    pub host: String,
+    pub port: u16,
+    /// Algorithm name, e.g. `ssh-ed25519`.
+    #[serde(default)]
+    pub key_type: String,
+    /// OpenSSH-encoded public key, e.g. `ssh-ed25519 AAAA...`.
+    pub public_key: String,
+    /// Human readable fingerprint, e.g. `SHA256:...`.
+    #[serde(default)]
+    pub fingerprint: String,
+}
+
+/// Host keys trusted by this application.
+///
+/// This is deliberately separate from `~/.ssh/known_hosts`: RGFTP keeps its
+/// own list so it never silently rewrites files managed by OpenSSH.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct KnownHosts {
+    #[serde(default)]
+    pub hosts: Vec<KnownHost>,
+}
+
+impl KnownHosts {
+    pub fn load() -> Self {
+        let path = known_hosts_path();
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self) {
+        let path = known_hosts_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(text) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(path, text);
+        }
+    }
+
+    /// Looks up the key recorded for one host, port and key algorithm.
+    ///
+    /// Keys are tracked per algorithm because a server may legitimately offer
+    /// several host keys (for example Ed25519 and RSA).
+    pub fn find(&self, host: &str, port: u16, key_type: &str) -> Option<&KnownHost> {
+        self.hosts.iter().find(|entry| {
+            entry.port == port
+                && entry.key_type.eq_ignore_ascii_case(key_type)
+                && entry.host.eq_ignore_ascii_case(host.trim())
+        })
+    }
+
+    /// Adds or replaces the stored key for a host and algorithm, so a changed
+    /// key does not leave a stale entry behind.
+    pub fn upsert(&mut self, entry: KnownHost) {
+        let host = entry.host.trim().to_string();
+        self.hosts.retain(|existing| {
+            !(existing.port == entry.port
+                && existing
+                    .key_type
+                    .eq_ignore_ascii_case(entry.key_type.as_str())
+                && existing.host.eq_ignore_ascii_case(&host))
+        });
+        self.hosts.push(KnownHost { host, ..entry });
+    }
+}
+
+pub fn known_hosts_path() -> PathBuf {
+    config_dir().join("known_hosts.json")
 }
 
 /// One row in either file pane.
@@ -472,5 +550,63 @@ mod tests {
             settings.connection("3").unwrap().group_id.as_deref(),
             Some("a")
         );
+    }
+
+    #[test]
+    fn known_hosts_replace_the_key_for_the_same_endpoint() {
+        let mut known_hosts = KnownHosts::default();
+        known_hosts.upsert(KnownHost {
+            host: "Example.test".to_string(),
+            port: 22,
+            key_type: "ssh-ed25519".to_string(),
+            public_key: "ssh-ed25519 old".to_string(),
+            fingerprint: "SHA256:old".to_string(),
+        });
+
+        assert!(
+            known_hosts
+                .find("example.test", 22, "ssh-ed25519")
+                .is_some()
+        );
+        assert!(
+            known_hosts
+                .find("example.test", 2222, "ssh-ed25519")
+                .is_none()
+        );
+        assert!(known_hosts.find("example.test", 22, "ssh-rsa").is_none());
+
+        known_hosts.upsert(KnownHost {
+            host: "example.test".to_string(),
+            port: 22,
+            key_type: "ssh-ed25519".to_string(),
+            public_key: "ssh-ed25519 new".to_string(),
+            fingerprint: "SHA256:new".to_string(),
+        });
+
+        assert_eq!(known_hosts.hosts.len(), 1);
+        assert_eq!(
+            known_hosts
+                .find("example.test", 22, "ssh-ed25519")
+                .unwrap()
+                .public_key,
+            "ssh-ed25519 new"
+        );
+
+        // A different algorithm is stored independently instead of replacing
+        // the Ed25519 entry.
+        known_hosts.upsert(KnownHost {
+            host: "example.test".to_string(),
+            port: 22,
+            key_type: "ssh-rsa".to_string(),
+            public_key: "ssh-rsa new".to_string(),
+            fingerprint: "SHA256:rsa".to_string(),
+        });
+        assert_eq!(known_hosts.hosts.len(), 2);
+        assert!(
+            known_hosts
+                .find("example.test", 22, "ssh-ed25519")
+                .is_some()
+        );
+        assert!(known_hosts.find("example.test", 22, "ssh-rsa").is_some());
     }
 }

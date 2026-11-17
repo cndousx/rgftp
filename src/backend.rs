@@ -1,4 +1,4 @@
-use crate::model::{AuthMethod, ConnectionProfile, FileEntry, sort_entries};
+use crate::model::{AuthMethod, ConnectionProfile, FileEntry, KnownHost, KnownHosts, sort_entries};
 use crate::util::{expand_tilde, is_hidden, join_remote};
 use async_channel::Sender;
 use russh_sftp::client::SftpSession;
@@ -33,6 +33,20 @@ pub enum BackendEvent {
     ConnectFailed {
         profile_id: String,
         error: String,
+    },
+    /// The server presented a host key that is unknown or has changed.
+    ///
+    /// The worker waits for [`HostKeyDecision`] before the SSH handshake can
+    /// continue, so the UI must always answer this request.
+    HostKeyVerification {
+        profile_id: String,
+        request_id: u64,
+        host: String,
+        port: u16,
+        key_type: String,
+        fingerprint: String,
+        /// Fingerprint of the key that was trusted before, when it changed.
+        previous_fingerprint: Option<String>,
     },
     Listed {
         session_id: String,
@@ -147,14 +161,30 @@ pub enum BackendCommand {
     },
 }
 
+/// How the user answered a [`BackendEvent::HostKeyVerification`] prompt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostKeyDecision {
+    /// Accept the key, saving it to the known-hosts list when `remember`.
+    Trust { remember: bool },
+    /// Abort the connection because the key was not trusted.
+    Reject,
+}
+
+struct HostKeyReply {
+    request_id: u64,
+    decision: HostKeyDecision,
+}
+
 pub struct SftpWorker {
     tx: tokio::sync::mpsc::UnboundedSender<BackendCommand>,
+    host_key_tx: tokio::sync::mpsc::UnboundedSender<HostKeyReply>,
     cancel: Arc<AtomicBool>,
 }
 
 impl SftpWorker {
     pub fn spawn(events: Sender<BackendEvent>) -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<BackendCommand>();
+        let (host_key_tx, host_key_rx) = tokio::sync::mpsc::unbounded_channel::<HostKeyReply>();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
 
@@ -175,13 +205,57 @@ impl SftpWorker {
                 runtime.block_on(async move {
                     let mut clients: HashMap<String, Client> = HashMap::new();
                     let mut next_transfer_id = 1u64;
+                    let mut next_host_key_request = 1u64;
+                    // Pending host-key prompts, keyed by request id. UI answers
+                    // arrive on their own channel because the command loop is
+                    // blocked inside `connect_client` while a key is checked.
+                    let pending_host_keys: Arc<
+                        tokio::sync::Mutex<
+                            HashMap<u64, tokio::sync::oneshot::Sender<HostKeyDecision>>,
+                        >,
+                    > = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+                    {
+                        let pending_host_keys = pending_host_keys.clone();
+                        let mut host_key_rx = host_key_rx;
+                        tokio::spawn(async move {
+                            while let Some(reply) = host_key_rx.recv().await {
+                                let sender =
+                                    pending_host_keys.lock().await.remove(&reply.request_id);
+                                if let Some(sender) = sender {
+                                    let _ = sender.send(reply.decision);
+                                }
+                            }
+                        });
+                    }
 
                     while let Some(command) = rx.recv().await {
                         match command {
                             BackendCommand::Connect { profile } => {
                                 clients.remove(&profile.id);
 
-                                match connect_client(&profile).await {
+                                let request_id = next_host_key_request;
+                                next_host_key_request += 1;
+                                let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
+                                pending_host_keys
+                                    .lock()
+                                    .await
+                                    .insert(request_id, decision_tx);
+                                let handler = ClientHandler {
+                                    profile_id: profile.id.clone(),
+                                    host: profile.host.clone(),
+                                    port: profile.port,
+                                    events: events.clone(),
+                                    request_id,
+                                    decision: Some(decision_rx),
+                                };
+
+                                let result = connect_client(&profile, handler).await;
+                                // Neither branch needs the slot anymore: either
+                                // the key was answered, or the connection failed
+                                // before asking.
+                                pending_host_keys.lock().await.remove(&request_id);
+
+                                match result {
                                     Ok(new_client) => {
                                         let requested = if profile.remote_dir.trim().is_empty() {
                                             ".".to_string()
@@ -557,11 +631,26 @@ impl SftpWorker {
             })
             .expect("failed to spawn SFTP worker thread");
 
-        Self { tx, cancel }
+        Self {
+            tx,
+            host_key_tx,
+            cancel,
+        }
     }
 
     pub fn send(&self, command: BackendCommand) {
         let _ = self.tx.send(command);
+    }
+
+    /// Answers a pending [`BackendEvent::HostKeyVerification`] prompt.
+    ///
+    /// This uses its own channel because the worker is blocked waiting for the
+    /// decision while the command queue is paused.
+    pub fn respond_host_key(&self, request_id: u64, decision: HostKeyDecision) {
+        let _ = self.host_key_tx.send(HostKeyReply {
+            request_id,
+            decision,
+        });
     }
 
     /// Ask the active upload/download to stop at the next chunk boundary.
@@ -614,18 +703,76 @@ struct Client {
     sftp: SftpSession,
     _session: russh::client::Handle<ClientHandler>,
 }
-struct ClientHandler;
+struct ClientHandler {
+    profile_id: String,
+    host: String,
+    port: u16,
+    events: Sender<BackendEvent>,
+    request_id: u64,
+    /// Consumed by the single `check_server_key` call of the initial key
+    /// exchange, then resolved with the user's answer.
+    decision: Option<tokio::sync::oneshot::Receiver<HostKeyDecision>>,
+}
 
 impl russh::client::Handler for ClientHandler {
     type Error = russh::Error;
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::PublicKeyOrCertificate,
+        server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        // A production client should verify the fingerprint against known_hosts.
-        // RGFTP accepts the key so first-time connections work out of the box.
-        Ok(true)
+        let public_key = server_public_key.public_key();
+        let key_type = public_key.algorithm().as_str().to_string();
+        let public_key_openssh = public_key.to_openssh().unwrap_or_default();
+        let fingerprint = public_key
+            .fingerprint(russh::keys::HashAlg::Sha256)
+            .to_string();
+
+        let mut known_hosts = KnownHosts::load();
+        let stored = known_hosts.find(&self.host, self.port, &key_type);
+        if let Some(stored) = stored
+            && stored.public_key.trim() == public_key_openssh.trim()
+        {
+            return Ok(true);
+        }
+
+        let previous_fingerprint = stored.map(|entry| entry.fingerprint.clone());
+        let _ = self
+            .events
+            .send(BackendEvent::HostKeyVerification {
+                profile_id: self.profile_id.clone(),
+                request_id: self.request_id,
+                host: self.host.clone(),
+                port: self.port,
+                key_type: key_type.clone(),
+                fingerprint: fingerprint.clone(),
+                previous_fingerprint,
+            })
+            .await;
+
+        let Some(decision) = self.decision.take() else {
+            return Ok(false);
+        };
+        let Ok(decision) = decision.await else {
+            return Ok(false);
+        };
+
+        match decision {
+            HostKeyDecision::Trust { remember } => {
+                if remember {
+                    known_hosts.upsert(KnownHost {
+                        host: self.host.clone(),
+                        port: self.port,
+                        key_type,
+                        public_key: public_key_openssh,
+                        fingerprint,
+                    });
+                    known_hosts.save();
+                }
+                Ok(true)
+            }
+            HostKeyDecision::Reject => Ok(false),
+        }
     }
 }
 
@@ -652,6 +799,8 @@ fn describe_connect_error(error: &str) -> String {
         Some("无法访问服务器，请检查网络连接")
     } else if lower.contains("reset by peer") || lower.contains("os error 10054") {
         Some("连接被服务器重置")
+    } else if lower.contains("unknown server key") || lower.contains("unknown key") {
+        Some("未信任服务器主机密钥，连接已取消")
     } else {
         None
     };
@@ -662,10 +811,13 @@ fn describe_connect_error(error: &str) -> String {
     }
 }
 
-async fn connect_client(profile: &ConnectionProfile) -> Result<Client, String> {
+async fn connect_client(
+    profile: &ConnectionProfile,
+    handler: ClientHandler,
+) -> Result<Client, String> {
     let config = Arc::new(russh::client::Config::default());
     let mut session =
-        russh::client::connect(config, (profile.host.as_str(), profile.port), ClientHandler)
+        russh::client::connect(config, (profile.host.as_str(), profile.port), handler)
             .await
             .map_err(|error| describe_connect_error(&error.to_string()))?;
 
