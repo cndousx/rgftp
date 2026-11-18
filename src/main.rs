@@ -6,6 +6,7 @@ mod app;
 mod backend;
 mod model;
 mod taskbar;
+mod theme_anim;
 mod util;
 
 use app::RgFtpApp;

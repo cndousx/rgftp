@@ -4,6 +4,7 @@ use crate::backend::{
 use crate::model::{
     AuthMethod, ConnectionProfile, FileEntry, Settings, ThemePreference, new_id, sort_entries,
 };
+use crate::theme_anim;
 use crate::util::{
     format_mode, format_mode_symbolic, format_progress, format_size, format_speed, format_time,
     join_remote, path_file_name, remote_parent,
@@ -15,7 +16,7 @@ use gpui_kit::component::input::*;
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::theme::{Theme, ThemeMode};
+use gpui_kit::component::theme::{Theme, ThemeColor, ThemeMode};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, InteractiveElementExt as _, Sizable, StyledExt, h_flex, v_flex,
@@ -384,6 +385,21 @@ pub struct RgFtpApp {
     sidebar_drop_target: Option<SidebarDropTarget>,
     /// A file drag is hovering the remote pane while no session is connected.
     remote_drag_blocked: bool,
+    /// Fade + circular wash covering a manual light/dark switch.
+    theme_transition: Option<ThemeTransition>,
+}
+
+/// A manual theme switch in flight, driven frame by frame from the click point.
+struct ThemeTransition {
+    /// Window-local coordinates of the theme button, in pixels.
+    origin_x: f32,
+    origin_y: f32,
+    /// Distance from the origin to the farthest window corner, with a margin.
+    radius: f32,
+    from: ThemeColor,
+    to: ThemeColor,
+    target: ThemeMode,
+    started: Instant,
 }
 
 impl RgFtpApp {
@@ -458,6 +474,7 @@ impl RgFtpApp {
             pending_overwrite: std::collections::VecDeque::new(),
             sidebar_drop_target: None,
             remote_drag_blocked: false,
+            theme_transition: None,
         };
 
         app._search_subscriptions = vec![
@@ -2377,9 +2394,140 @@ impl RgFtpApp {
         .detach();
     }
 
+    /// Switches to the opposite theme, with the new palette expanding out of
+    /// the point that was clicked.
+    fn toggle_theme(
+        &mut self,
+        origin_x: f32,
+        origin_y: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Ignore repeat clicks while a switch is playing: the palette sits
+        // halfway between the two themes and has no stable direction yet.
+        if self.theme_transition.is_some() {
+            return;
+        }
+
+        let target = if cx.theme().mode.is_dark() {
+            ThemeMode::Light
+        } else {
+            ThemeMode::Dark
+        };
+        self.settings.theme = Some(if target.is_dark() {
+            ThemePreference::Dark
+        } else {
+            ThemePreference::Light
+        });
+        self.settings.save();
+
+        if cx.reduce_motion() {
+            Theme::change(target, Some(window), cx);
+            cx.notify();
+            return;
+        }
+
+        let from = cx.theme().colors;
+        let to = theme_anim::palette_for(target, cx);
+        let viewport = window.viewport_size();
+        let dx = origin_x.max(f32::from(viewport.width) - origin_x);
+        let dy = origin_y.max(f32::from(viewport.height) - origin_y);
+        let radius = (dx * dx + dy * dy).sqrt() + 48.0;
+
+        self.theme_transition = Some(ThemeTransition {
+            origin_x,
+            origin_y,
+            radius,
+            from,
+            to,
+            target,
+            started: Instant::now(),
+        });
+        self.advance_theme_transition(window, cx);
+    }
+
+    /// Advances the palette fade by one frame and keeps the animation running
+    /// until the target theme is reached.
+    fn advance_theme_transition(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((started, from, to, target)) = self.theme_transition.as_ref().map(|transition| {
+            (
+                transition.started,
+                transition.from,
+                transition.to,
+                transition.target,
+            )
+        }) else {
+            return;
+        };
+
+        let t = theme_anim::progress(started);
+        theme_anim::apply(theme_anim::blend(from, to, theme_anim::ease(t)), cx);
+
+        if t >= 1.0 {
+            self.theme_transition = None;
+            // Reload the registered theme so tokens that carry gradients and
+            // the exact palette replace the interpolated colors.
+            Theme::change(target, None, cx);
+            cx.notify();
+        } else {
+            cx.notify();
+            cx.on_next_frame(window, |this, window, cx| {
+                this.advance_theme_transition(window, cx);
+            });
+        }
+    }
+
+    /// The circular wash painted over the page while the palette fades.
+    fn render_theme_reveal(&self) -> Option<AnyElement> {
+        let transition = self.theme_transition.as_ref()?;
+        let progress = theme_anim::progress(transition.started);
+        let radius = transition.radius * theme_anim::ease(progress);
+        // Fade out while growing, so nothing pops when the circle reaches the
+        // last corner and the transition ends.
+        let alpha = 0.5 * (1.0 - progress);
+        // Tinted with the palette being entered, so the wave is legible in both
+        // directions instead of blending into the background it sits on.
+        let wash = transition.to.background.opacity(alpha);
+
+        Some(
+            div()
+                .absolute()
+                .left(px(transition.origin_x - radius))
+                .top(px(transition.origin_y - radius))
+                .w(px(radius * 2.0))
+                .h(px(radius * 2.0))
+                .rounded_full()
+                .bg(wash)
+                .into_any_element(),
+        )
+    }
+
+    /// Blend of the two modes, 0 for light and 1 for dark. Follows a running
+    /// switch, for the few colors that are not theme tokens.
+    fn theme_darkness(&self, cx: &App) -> f32 {
+        let current = if cx.theme().mode.is_dark() { 1.0 } else { 0.0 };
+        match self.theme_transition.as_ref() {
+            Some(transition) => {
+                let target = if transition.target.is_dark() {
+                    1.0
+                } else {
+                    0.0
+                };
+                let eased = theme_anim::ease(theme_anim::progress(transition.started));
+                current + (target - current) * eased
+            }
+            None => current,
+        }
+    }
+
     fn render_header(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors;
-        let dark = cx.theme().mode.is_dark();
+        // While a switch is playing, flip the icon to the theme being entered
+        // right away so the button feels responsive.
+        let dark = self.theme_transition.as_ref().map_or_else(
+            || cx.theme().mode.is_dark(),
+            |transition| transition.target.is_dark(),
+        );
         let is_macos = cfg!(target_os = "macos");
         // `muted_foreground` is fairly dim on the dark title bar, which makes the
         // thin window-control glyphs hard to read. Brighten them in dark mode.
@@ -2534,21 +2682,17 @@ impl RgFtpApp {
                     } else {
                         "切换到深色主题"
                     })
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        let preference = if cx.theme().mode.is_dark() {
-                            ThemePreference::Light
-                        } else {
-                            ThemePreference::Dark
-                        };
-                        let mode = match preference {
-                            ThemePreference::Light => ThemeMode::Light,
-                            ThemePreference::Dark => ThemeMode::Dark,
-                        };
-                        Theme::change(mode, Some(window), cx);
-                        this.settings.theme = Some(preference);
-                        this.settings.save();
-                        cx.notify();
-                    })),
+                    .on_click(
+                        cx.listener(|this, event: &gpui_kit::ClickEvent, window, cx| {
+                            let position = event.position();
+                            this.toggle_theme(
+                                f32::from(position.x),
+                                f32::from(position.y),
+                                window,
+                                cx,
+                            );
+                        }),
+                    ),
             )
             .child(controls)
             .into_any_element()
@@ -3878,11 +4022,11 @@ impl RgFtpApp {
 
     fn render_status_bar(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors;
-        let status_bg: Hsla = if cx.theme().mode.is_dark() {
-            rgb(0x2e2e2e).into()
-        } else {
-            rgb(0xf8f8f8).into()
-        };
+        let status_bg: Hsla = theme_anim::mix_color(
+            rgb(0xf8f8f8).into(),
+            rgb(0x2e2e2e).into(),
+            self.theme_darkness(cx),
+        );
 
         let active_transfer = self.transfer.as_ref().filter(|transfer| {
             self.active_session.as_deref() == Some(transfer.session_id.as_str())
@@ -5383,6 +5527,7 @@ impl Render for RgFtpApp {
         } else {
             Some(self.render_toasts(cx))
         };
+        let theme_reveal = self.render_theme_reveal();
 
         div()
             .size_full()
@@ -5410,6 +5555,7 @@ impl Render for RgFtpApp {
             .when_some(context_menu, |this, menu| this.child(menu))
             .when_some(dialog, |this, dialog| this.child(dialog))
             .when_some(toasts, |this, toasts| this.child(toasts))
+            .when_some(theme_reveal, |this, reveal| this.child(reveal))
     }
 }
 
