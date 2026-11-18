@@ -1,4 +1,4 @@
-<p align="center">
+<p style="text-align: center;">
   <img src="assets/app-icon.png" width="112" alt="RGFTP icon">
 </p>
 
