@@ -1,6 +1,6 @@
 [package]
 name = "rgftp"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2024"
 description = "A small SFTP desktop client built with gpui-kit"
 license = "Apache-2.0"

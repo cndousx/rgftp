@@ -24,7 +24,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::{Instant, UNIX_EPOCH};
 
@@ -47,6 +47,127 @@ struct DragItem {
     path: String,
     name: String,
     is_dir: bool,
+}
+
+impl DragItem {
+    fn from_entry(side: Side, entry: &FileEntry) -> Self {
+        Self {
+            source: side,
+            path: entry.path.clone(),
+            name: entry.name.clone(),
+            is_dir: entry.is_dir,
+        }
+    }
+}
+
+/// The payload of one file drag. Holds every selected item so a batch of files
+/// can be transferred with a single drag.
+///
+/// `items` is shared so rows rendered for the same selection can all point at
+/// one list instead of cloning every selected name.
+#[derive(Clone)]
+struct FileDrag {
+    source: Side,
+    items: Arc<Vec<DragItem>>,
+}
+
+impl FileDrag {
+    fn single(item: DragItem) -> Self {
+        Self {
+            source: item.source,
+            items: Arc::new(vec![item]),
+        }
+    }
+
+    /// Label shown in the drag preview.
+    fn label(&self) -> SharedString {
+        match self.items.as_slice() {
+            [item] => item.name.clone().into(),
+            items => format!("{} 个项目", items.len()).into(),
+        }
+    }
+
+    /// The preview uses a folder icon only when every dragged item is a folder.
+    fn all_dirs(&self) -> bool {
+        !self.items.is_empty() && self.items.iter().all(|item| item.is_dir)
+    }
+}
+
+/// Multi-selection state for one file pane.
+///
+/// Selection is index based into the currently visible (filtered) entries, so
+/// it is cleared whenever the listing or the filter changes.
+#[derive(Clone, Default)]
+struct Selection {
+    indices: HashSet<usize>,
+    /// Anchor of the last non-shift selection, used for shift+click ranges.
+    anchor: Option<usize>,
+}
+
+impl Selection {
+    fn clear(&mut self) {
+        self.indices.clear();
+        self.anchor = None;
+    }
+
+    fn len(&self) -> usize {
+        self.indices.len()
+    }
+
+    /// True while more than one item is selected; batch mode disables the
+    /// per-file context menu.
+    fn is_multi(&self) -> bool {
+        self.indices.len() > 1
+    }
+
+    fn select_only(&mut self, index: usize) {
+        self.indices.clear();
+        self.indices.insert(index);
+        self.anchor = Some(index);
+    }
+
+    /// Applies a row click: plain replaces the selection, the secondary
+    /// (Ctrl / Cmd) modifier toggles one item, Shift selects a range from the
+    /// anchor.
+    fn apply_click(&mut self, index: usize, shift: bool, toggle: bool, len: usize) {
+        self.retain_valid(len);
+        if shift {
+            let anchor = self.anchor.unwrap_or(index);
+            let (start, end) = if anchor <= index {
+                (anchor, index)
+            } else {
+                (index, anchor)
+            };
+            self.indices = (start..=end).collect();
+            self.anchor = Some(anchor);
+        } else if toggle {
+            if !self.indices.remove(&index) {
+                self.indices.insert(index);
+            }
+            self.anchor = Some(index);
+        } else {
+            self.select_only(index);
+        }
+    }
+
+    /// Drops indices that no longer exist in the listing.
+    fn retain_valid(&mut self, len: usize) {
+        self.indices.retain(|index| *index < len);
+        if self.anchor.is_some_and(|anchor| anchor >= len) {
+            self.anchor = self.indices.iter().min().copied();
+        }
+    }
+
+    /// The selected entries in listing order, used to build a batch drag.
+    fn drag_items(&self, side: Side, entries: &[FileEntry]) -> Vec<DragItem> {
+        let mut indices: Vec<usize> = self.indices.iter().copied().collect();
+        indices.sort_unstable();
+        indices
+            .into_iter()
+            .filter_map(|index| entries.get(index))
+            .map(|entry| DragItem::from_entry(side, entry))
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -97,7 +218,7 @@ struct LocalPane {
     path: PathBuf,
     all_entries: Arc<Vec<FileEntry>>,
     entries: Arc<Vec<FileEntry>>,
-    selected: Option<usize>,
+    selection: Selection,
     error: Option<String>,
 }
 
@@ -105,7 +226,7 @@ struct RemotePane {
     path: String,
     all_entries: Arc<Vec<FileEntry>>,
     entries: Arc<Vec<FileEntry>>,
-    selected: Option<usize>,
+    selection: Selection,
     loading: bool,
     error: Option<String>,
 }
@@ -260,6 +381,27 @@ struct QueuedUpload {
     name: String,
 }
 
+/// A download whose local target already exists, waiting for the user to
+/// confirm overwriting it.
+#[derive(Clone)]
+struct QueuedDownload {
+    session_id: String,
+    remote: String,
+    local: PathBuf,
+    name: String,
+}
+
+impl QueuedDownload {
+    fn into_request(self) -> TransferRequest {
+        TransferRequest::Download {
+            session_id: self.session_id,
+            remote: self.remote,
+            local: self.local,
+            name: self.name,
+        }
+    }
+}
+
 /// A single upload or download waiting to be dispatched to the backend.
 #[derive(Clone)]
 enum TransferRequest {
@@ -321,6 +463,7 @@ enum ConfirmAction {
         name: String,
     },
     UploadOverwrite(QueuedUpload),
+    DownloadOverwrite(QueuedDownload),
 }
 
 struct ConfirmDialog {
@@ -329,6 +472,8 @@ struct ConfirmDialog {
     action: ConfirmAction,
     /// Label of the confirm button, e.g. `删除` or `覆盖`.
     confirm_label: SharedString,
+    /// Icon of the confirm button.
+    confirm_icon: IconName,
     /// Whether the confirm button uses the danger style.
     danger: bool,
 }
@@ -385,7 +530,8 @@ pub struct RgFtpApp {
     _search_subscriptions: Vec<Subscription>,
     toasts: Vec<ToastItem>,
     next_toast_id: u64,
-    pending_overwrite: std::collections::VecDeque<QueuedUpload>,
+    pending_upload_overwrite: std::collections::VecDeque<QueuedUpload>,
+    pending_download_overwrite: std::collections::VecDeque<QueuedDownload>,
     sidebar_drop_target: Option<SidebarDropTarget>,
     /// A file drag is hovering the remote pane while no session is connected.
     remote_drag_blocked: bool,
@@ -450,7 +596,7 @@ impl RgFtpApp {
                 path: local_path.clone(),
                 all_entries: Arc::new(Vec::new()),
                 entries: Arc::new(Vec::new()),
-                selected: None,
+                selection: Selection::default(),
                 error: None,
             },
             local_scroll: UniformListScrollHandle::new(),
@@ -478,7 +624,8 @@ impl RgFtpApp {
             _search_subscriptions: Vec::new(),
             toasts: Vec::new(),
             next_toast_id: 1,
-            pending_overwrite: std::collections::VecDeque::new(),
+            pending_upload_overwrite: std::collections::VecDeque::new(),
+            pending_download_overwrite: std::collections::VecDeque::new(),
             sidebar_drop_target: None,
             remote_drag_blocked: false,
             theme_transition: None,
@@ -582,7 +729,7 @@ impl RgFtpApp {
                             path: home.clone(),
                             all_entries: Arc::new(Vec::new()),
                             entries: Arc::new(Vec::new()),
-                            selected: None,
+                            selection: Selection::default(),
                             loading: true,
                             error: None,
                         },
@@ -660,7 +807,7 @@ impl RgFtpApp {
                     session.pane.path = path;
                     session.pane.all_entries = all_entries;
                     session.pane.entries = visible_entries;
-                    session.pane.selected = None;
+                    session.pane.selection.clear();
                     session.pane.loading = false;
                     session.pane.error = None;
                     session.scroll.scroll_to_item(0, ScrollStrategy::Top);
@@ -1073,7 +1220,7 @@ impl RgFtpApp {
                     Arc::new(filter_entries(&all_entries, &self.local_query, false));
                 self.local.all_entries = all_entries;
                 self.local.path = path.clone();
-                self.local.selected = None;
+                self.local.selection.clear();
                 self.local.error = None;
                 self.local_scroll.scroll_to_item(0, ScrollStrategy::Top);
                 self.settings.local_dir = Some(path);
@@ -1084,7 +1231,7 @@ impl RgFtpApp {
                 self.local.path = path;
                 self.local.entries = Arc::new(Vec::new());
                 self.local.all_entries = Arc::new(Vec::new());
-                self.local.selected = None;
+                self.local.selection.clear();
             }
         }
         Self::refresh_scrollbar_layout(cx);
@@ -1167,7 +1314,7 @@ impl RgFtpApp {
         session.pane.path = path.clone();
         session.pane.loading = true;
         session.pane.error = None;
-        session.pane.selected = None;
+        session.pane.selection.clear();
         self.pending_path_jump = true;
         self.worker
             .send(BackendCommand::Locate { session_id, path });
@@ -1203,7 +1350,7 @@ impl RgFtpApp {
         session.pane.path = path.clone();
         session.pane.loading = true;
         session.pane.error = None;
-        session.pane.selected = None;
+        session.pane.selection.clear();
         // Mouse navigation should refresh the path box immediately, even if
         // the box still holds focus from an earlier edit.
         self.pending_path_jump = true;
@@ -1221,7 +1368,7 @@ impl RgFtpApp {
                 &query,
                 show_hidden,
             ));
-            session.pane.selected = None;
+            session.pane.selection.clear();
             session.scroll.scroll_to_item(0, ScrollStrategy::Top);
         }
         cx.notify();
@@ -1235,7 +1382,7 @@ impl RgFtpApp {
             &self.local_query,
             false,
         ));
-        self.local.selected = None;
+        self.local.selection.clear();
         self.local_scroll.scroll_to_item(0, ScrollStrategy::Top);
         cx.notify();
     }
@@ -1251,23 +1398,31 @@ impl RgFtpApp {
                 &query,
                 show_hidden,
             ));
-            session.pane.selected = None;
+            session.pane.selection.clear();
             session.scroll.scroll_to_item(0, ScrollStrategy::Top);
         }
         cx.notify();
     }
 
+    /// Handles a row click. `shift` extends the selection from the anchor and
+    /// `toggle` (Ctrl / Cmd) adds or removes a single row.
     fn on_entry_click(
         &mut self,
         side: Side,
         index: usize,
         click_count: usize,
+        shift: bool,
+        toggle: bool,
         cx: &mut Context<Self>,
     ) {
         match side {
             Side::Local => {
-                self.local.selected = Some(index);
+                self.local
+                    .selection
+                    .apply_click(index, shift, toggle, self.local.entries.len());
                 if click_count >= 2
+                    && !shift
+                    && !toggle
                     && let Some(entry) = self.local.entries.get(index).cloned()
                     && entry.is_dir
                 {
@@ -1279,9 +1434,15 @@ impl RgFtpApp {
                 let Some(session) = self.active_session_state_mut() else {
                     return;
                 };
-                session.pane.selected = Some(index);
+                let len = session.pane.entries.len();
+                session
+                    .pane
+                    .selection
+                    .apply_click(index, shift, toggle, len);
                 let entry = session.pane.entries.get(index).cloned();
                 if click_count >= 2
+                    && !shift
+                    && !toggle
                     && let Some(entry) = entry
                     && entry.is_dir
                 {
@@ -1513,6 +1674,10 @@ impl RgFtpApp {
         );
     }
 
+    fn enqueue_download(&mut self, download: QueuedDownload, cx: &mut Context<Self>) {
+        self.enqueue_transfer(download.into_request(), cx);
+    }
+
     /// Queues uploads that do not collide, then asks about each collision.
     fn enqueue_uploads(
         &mut self,
@@ -1544,13 +1709,13 @@ impl RgFtpApp {
         for upload in ready {
             self.enqueue_upload(upload, cx);
         }
-        self.pending_overwrite.extend(conflicts);
+        self.pending_upload_overwrite.extend(conflicts);
 
         if added > 0 {
             self.status = format!("已加入 {added} 个上传任务").into();
             self.status_kind = StatusKind::Info;
         }
-        self.prompt_next_overwrite(cx);
+        self.prompt_next_conflict(cx);
         cx.notify();
     }
 
@@ -1570,9 +1735,9 @@ impl RgFtpApp {
         self.enqueue_uploads(session_id, remote_path, paths, cx);
     }
 
-    fn handle_drop_on_remote(&mut self, item: DragItem, cx: &mut Context<Self>) {
+    fn handle_drop_on_remote(&mut self, drag: FileDrag, cx: &mut Context<Self>) {
         self.clear_remote_drag_state(cx);
-        if item.source != Side::Local {
+        if drag.source != Side::Local {
             return;
         }
         let Some((session_id, remote_path)) = self
@@ -1586,12 +1751,19 @@ impl RgFtpApp {
             return;
         };
 
-        let local = PathBuf::from(item.path);
-        self.enqueue_uploads(session_id, remote_path, vec![local], cx);
+        let paths: Vec<PathBuf> = drag
+            .items
+            .iter()
+            .map(|item| PathBuf::from(&item.path))
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        self.enqueue_uploads(session_id, remote_path, paths, cx);
     }
 
-    fn handle_drop_on_local(&mut self, item: DragItem, cx: &mut Context<Self>) {
-        if item.source != Side::Remote {
+    fn handle_drop_on_local(&mut self, drag: FileDrag, cx: &mut Context<Self>) {
+        if drag.source != Side::Remote {
             return;
         }
         let Some(session_id) = self
@@ -1601,16 +1773,25 @@ impl RgFtpApp {
             return;
         };
 
-        let local = self.local.path.join(&item.name);
-        self.enqueue_transfer(
-            TransferRequest::Download {
-                session_id,
-                remote: item.path,
-                local,
-                name: item.name,
-            },
-            cx,
-        );
+        if drag.items.is_empty() {
+            return;
+        }
+        let target_dir = self.local.path.clone();
+        let (ready, conflicts) =
+            partition_download_conflicts(&target_dir, &session_id, &drag.items);
+
+        let added = ready.len();
+        for download in ready {
+            self.enqueue_download(download, cx);
+        }
+        self.pending_download_overwrite.extend(conflicts);
+
+        if added > 1 {
+            self.status = format!("已加入 {added} 个下载任务").into();
+            self.status_kind = StatusKind::Info;
+        }
+        self.prompt_next_conflict(cx);
+        cx.notify();
     }
 
     fn toggle_group(&mut self, id: String, cx: &mut Context<Self>) {
@@ -1715,17 +1896,31 @@ impl RgFtpApp {
         }
 
         // Dismissing an overwrite prompt skips that file and moves on to the
-        // next conflicting upload, if any.
-        if matches!(
-            &self.dialog,
-            DialogState::Confirm(confirm)
-                if matches!(confirm.action, ConfirmAction::UploadOverwrite(_))
-        ) {
-            self.pending_overwrite.pop_front();
-            self.dialog = DialogState::None;
-            self.prompt_next_overwrite(cx);
-            cx.notify();
-            return;
+        // next conflicting transfer, if any.
+        if let DialogState::Confirm(confirm) = &self.dialog {
+            match &confirm.action {
+                ConfirmAction::UploadOverwrite(_) => {
+                    self.pending_upload_overwrite.pop_front();
+                    self.dialog = DialogState::None;
+                    self.prompt_next_conflict(cx);
+                    cx.notify();
+                    return;
+                }
+                ConfirmAction::DownloadOverwrite(download) => {
+                    let name = download.name.clone();
+                    self.pending_download_overwrite.pop_front();
+                    self.dialog = DialogState::None;
+                    // Cancelling the prompt stops this download instead of
+                    // overwriting the existing local file.
+                    self.status = format!("已取消下载：{name}").into();
+                    self.status_kind = StatusKind::Info;
+                    self.push_toast(ToastKind::Cancel, format!("下载已取消：{name}"), cx);
+                    self.prompt_next_conflict(cx);
+                    cx.notify();
+                    return;
+                }
+                _ => {}
+            }
         }
 
         self.dialog = DialogState::None;
@@ -1918,6 +2113,7 @@ impl RgFtpApp {
             message: message.into(),
             action,
             confirm_label: "删除".into(),
+            confirm_icon: IconName::Trash,
             danger: true,
         });
         cx.notify();
@@ -1925,10 +2121,8 @@ impl RgFtpApp {
 
     /// Asks before overwriting a remote file that was just dropped onto the
     /// server pane.
-    fn prompt_next_overwrite(&mut self, cx: &mut Context<Self>) {
-        let Some(upload) = self.pending_overwrite.front().cloned() else {
-            // No more conflicts: drop the attention hint from the taskbar.
-            crate::taskbar::clear_notification();
+    fn prompt_next_upload_overwrite(&mut self, cx: &mut Context<Self>) {
+        let Some(upload) = self.pending_upload_overwrite.front().cloned() else {
             return;
         };
         self.dialog = DialogState::Confirm(ConfirmDialog {
@@ -1936,12 +2130,43 @@ impl RgFtpApp {
             message: format!("服务器当前目录已存在“{}”，是否覆盖？", upload.name).into(),
             action: ConfirmAction::UploadOverwrite(upload),
             confirm_label: "覆盖".into(),
+            confirm_icon: IconName::Upload,
             danger: false,
         });
         // The dialog can appear while the app is not focused, so play a sound
         // and blink a red badge on the taskbar button as well.
         crate::taskbar::notify();
         cx.notify();
+    }
+
+    /// Asks before overwriting a local file when downloading. The download is
+    /// only queued after the user confirms.
+    fn prompt_next_download_overwrite(&mut self, cx: &mut Context<Self>) {
+        let Some(download) = self.pending_download_overwrite.front().cloned() else {
+            return;
+        };
+        self.dialog = DialogState::Confirm(ConfirmDialog {
+            title: "文件已存在".into(),
+            message: format!("本地目录已存在“{}”，是否覆盖？", download.name).into(),
+            action: ConfirmAction::DownloadOverwrite(download),
+            confirm_label: "覆盖".into(),
+            confirm_icon: IconName::Download,
+            danger: false,
+        });
+        crate::taskbar::notify();
+        cx.notify();
+    }
+
+    /// Shows the next pending overwrite confirmation, or drops the taskbar
+    /// attention badge once both upload and download prompts are handled.
+    fn prompt_next_conflict(&mut self, cx: &mut Context<Self>) {
+        if !self.pending_download_overwrite.is_empty() {
+            self.prompt_next_download_overwrite(cx);
+        } else if !self.pending_upload_overwrite.is_empty() {
+            self.prompt_next_upload_overwrite(cx);
+        } else {
+            crate::taskbar::clear_notification();
+        }
     }
 
     fn open_context_menu(
@@ -1959,6 +2184,15 @@ impl RgFtpApp {
         cx.notify();
     }
 
+    /// Explains why a right click did not open the file context menu while
+    /// several files are selected.
+    fn report_context_menu_disabled(&mut self, count: usize, cx: &mut Context<Self>) {
+        self.context_menu = None;
+        self.status = format!("已选中 {count} 个项目：批量选择时右键菜单不可用").into();
+        self.status_kind = StatusKind::Info;
+        cx.notify();
+    }
+
     fn open_file_context_menu(
         &mut self,
         side: Side,
@@ -1966,12 +2200,31 @@ impl RgFtpApp {
         position: gpui_kit::Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
+        // With more than one file selected the context menu is disabled: menu
+        // actions only apply to a single file, so the selection is kept as-is.
+        let multi_count = match side {
+            Side::Local => self
+                .local
+                .selection
+                .is_multi()
+                .then(|| self.local.selection.len()),
+            Side::Remote => self
+                .active_session_state()
+                .map(|session| &session.pane.selection)
+                .filter(|selection| selection.is_multi())
+                .map(Selection::len),
+        };
+        if let Some(count) = multi_count {
+            self.report_context_menu_disabled(count, cx);
+            return;
+        }
+
         let (session_id, entry) = match side {
             Side::Local => {
                 let Some(index) = self.local.entries.iter().position(|e| e.path == path) else {
                     return;
                 };
-                self.local.selected = Some(index);
+                self.local.selection.select_only(index);
                 (None, self.local.entries[index].clone())
             }
             Side::Remote => {
@@ -1984,7 +2237,7 @@ impl RgFtpApp {
                 let Some(index) = session.pane.entries.iter().position(|e| e.path == path) else {
                     return;
                 };
-                session.pane.selected = Some(index);
+                session.pane.selection.select_only(index);
                 (Some(session_id), session.pane.entries[index].clone())
             }
         };
@@ -2294,10 +2547,18 @@ impl RgFtpApp {
     fn apply_confirm(&mut self, action: ConfirmAction, cx: &mut Context<Self>) {
         match action {
             ConfirmAction::UploadOverwrite(upload) => {
-                self.pending_overwrite.pop_front();
+                self.pending_upload_overwrite.pop_front();
                 self.dialog = DialogState::None;
                 self.enqueue_upload(upload, cx);
-                self.prompt_next_overwrite(cx);
+                self.prompt_next_conflict(cx);
+                cx.notify();
+                return;
+            }
+            ConfirmAction::DownloadOverwrite(download) => {
+                self.pending_download_overwrite.pop_front();
+                self.dialog = DialogState::None;
+                self.enqueue_download(download, cx);
+                self.prompt_next_conflict(cx);
                 cx.notify();
                 return;
             }
@@ -3520,11 +3781,11 @@ impl RgFtpApp {
             .border_color(colors.border)
             .bg(colors.background)
             .overflow_hidden()
-            .drag_over::<DragItem>(|this, _, _, cx| {
+            .drag_over::<FileDrag>(|this, _, _, cx| {
                 this.bg(cx.theme().colors.primary.opacity(0.05))
                     .border_color(cx.theme().colors.primary)
             })
-            .on_drop(cx.listener(|this, item: &DragItem, _, cx| {
+            .on_drop(cx.listener(|this, item: &FileDrag, _, cx| {
                 this.handle_drop_on_local(item.clone(), cx)
             }))
             .on_drop(cx.listener(|this, _: &ExternalPaths, _, cx| {
@@ -3622,7 +3883,8 @@ impl RgFtpApp {
         let colors = cx.theme().colors;
         let entries = self.local.entries.clone();
         let view = cx.entity();
-        let selected = self.local.selected;
+        let selected_indices = Arc::new(self.local.selection.indices.clone());
+        let selected_items = Arc::new(self.local.selection.drag_items(Side::Local, &entries));
 
         if let Some(error) = &self.local.error {
             return render_pane_error(error, colors.danger, colors);
@@ -3649,11 +3911,21 @@ impl RgFtpApp {
         let list = uniform_list("local-files", count, move |range, _window, cx| {
             range
                 .map(|index| {
+                    let selected = selected_indices.contains(&index);
+                    let drag = if selected && selected_items.len() > 1 {
+                        FileDrag {
+                            source: Side::Local,
+                            items: selected_items.clone(),
+                        }
+                    } else {
+                        FileDrag::single(DragItem::from_entry(Side::Local, &entries[index]))
+                    };
                     render_file_row(
                         Side::Local,
                         index,
                         &entries[index],
-                        selected == Some(index),
+                        selected,
+                        drag,
                         view.clone(),
                         cx,
                     )
@@ -3700,7 +3972,7 @@ impl RgFtpApp {
             .border_color(colors.border)
             .bg(colors.background)
             .overflow_hidden()
-            .drag_over::<DragItem>(move |this, _, _, cx| {
+            .drag_over::<FileDrag>(move |this, _, _, cx| {
                 if connected {
                     this.bg(cx.theme().colors.primary.opacity(0.05))
                         .border_color(cx.theme().colors.primary)
@@ -3719,7 +3991,7 @@ impl RgFtpApp {
                 }
             })
             .on_drag_move(
-                cx.listener(|this, event: &DragMoveEvent<DragItem>, window, cx| {
+                cx.listener(|this, event: &DragMoveEvent<FileDrag>, window, cx| {
                     this.update_remote_drag_state(
                         event.bounds.contains(&event.event.position),
                         window,
@@ -3748,7 +4020,7 @@ impl RgFtpApp {
                 cx.listener(|this, _, _, cx| this.clear_remote_drag_state(cx)),
             )
             .on_file_drop_exit(cx.listener(|this, _, _, cx| this.clear_remote_drag_state(cx)))
-            .on_drop(cx.listener(|this, item: &DragItem, _, cx| {
+            .on_drop(cx.listener(|this, item: &FileDrag, _, cx| {
                 this.handle_drop_on_remote(item.clone(), cx)
             }))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
@@ -4036,17 +4308,28 @@ impl RgFtpApp {
 
         let entries = session.pane.entries.clone();
         let view = cx.entity();
-        let selected = session.pane.selected;
+        let selected_indices = Arc::new(session.pane.selection.indices.clone());
+        let selected_items = Arc::new(session.pane.selection.drag_items(Side::Remote, &entries));
         let count = entries.len();
 
         let list = uniform_list("remote-files", count, move |range, _window, cx| {
             range
                 .map(|index| {
+                    let selected = selected_indices.contains(&index);
+                    let drag = if selected && selected_items.len() > 1 {
+                        FileDrag {
+                            source: Side::Remote,
+                            items: selected_items.clone(),
+                        }
+                    } else {
+                        FileDrag::single(DragItem::from_entry(Side::Remote, &entries[index]))
+                    };
                     render_file_row(
                         Side::Remote,
                         index,
                         &entries[index],
-                        selected == Some(index),
+                        selected,
+                        drag,
                         view.clone(),
                         cx,
                     )
@@ -5560,6 +5843,7 @@ impl RgFtpApp {
         let action = confirm.action.clone();
         let danger = confirm.danger;
         let confirm_label = confirm.confirm_label.clone();
+        let confirm_icon = confirm.confirm_icon;
         let footer = h_flex()
             .gap_2()
             .child(
@@ -5574,11 +5858,7 @@ impl RgFtpApp {
                     .when(danger, |button| button.danger())
                     .when(!danger, |button| button.primary())
                     .small()
-                    .icon(if danger {
-                        IconName::Trash
-                    } else {
-                        IconName::Upload
-                    })
+                    .icon(confirm_icon)
                     .label(confirm_label)
                     .on_click(
                         cx.listener(move |this, _, _, cx| this.apply_confirm(action.clone(), cx)),
@@ -5630,7 +5910,7 @@ impl Render for RgFtpApp {
                             .child(self.render_main(cx)),
                     ),
             )
-            .on_drag_move(cx.listener(|this, _: &DragMoveEvent<DragItem>, _, cx| {
+            .on_drag_move(cx.listener(|this, _: &DragMoveEvent<FileDrag>, _, cx| {
                 this.set_sidebar_drop_target(None, cx);
             }))
             .on_drop(cx.listener(|this, _: &SidebarDragItem, _, cx| {
@@ -5770,6 +6050,40 @@ fn filter_entries(entries: &[FileEntry], query: &str, show_hidden: bool) -> Vec<
         .filter(|entry| query.is_empty() || crate::util::fuzzy_match(&entry.name, query))
         .cloned()
         .collect()
+}
+
+/// Splits a dragged remote batch into downloads that can start right away and
+/// ones that need an overwrite confirmation because the local target name is
+/// already taken.
+fn partition_download_conflicts(
+    target_dir: &Path,
+    session_id: &str,
+    items: &[DragItem],
+) -> (Vec<QueuedDownload>, Vec<QueuedDownload>) {
+    let mut ready = Vec::new();
+    let mut conflicts = Vec::new();
+
+    for item in items {
+        let local = target_dir.join(&item.name);
+        let download = QueuedDownload {
+            session_id: session_id.to_string(),
+            remote: item.path.clone(),
+            local: local.clone(),
+            name: item.name.clone(),
+        };
+        if local_target_exists(&local) {
+            conflicts.push(download);
+        } else {
+            ready.push(download);
+        }
+    }
+
+    (ready, conflicts)
+}
+
+/// True when anything already occupies `path`, including a broken symlink.
+fn local_target_exists(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
 }
 
 fn context_menu_item(
@@ -5951,16 +6265,11 @@ fn render_file_row(
     index: usize,
     entry: &FileEntry,
     selected: bool,
+    drag: FileDrag,
     view: Entity<RgFtpApp>,
     cx: &mut App,
 ) -> AnyElement {
     let colors = cx.theme().colors;
-    let payload = DragItem {
-        source: side,
-        path: entry.path.clone(),
-        name: entry.name.clone(),
-        is_dir: entry.is_dir,
-    };
 
     let click_view = view.clone();
     let menu_view = view.clone();
@@ -6025,8 +6334,11 @@ fn render_file_row(
         )
         .on_click(move |event, _window, cx| {
             let click_count = event.click_count();
+            let modifiers = event.modifiers();
+            let shift = modifiers.shift;
+            let toggle = modifiers.secondary(cx);
             click_view.update(cx, |app, cx| {
-                app.on_entry_click(side, index, click_count, cx);
+                app.on_entry_click(side, index, click_count, shift, toggle, cx);
             });
         })
         .on_mouse_down(MouseButton::Right, move |event, _, cx| {
@@ -6035,11 +6347,170 @@ fn render_file_row(
                 app.open_file_context_menu(side, menu_path.clone(), position, cx);
             });
         })
-        .on_drag(payload, |payload, _offset, _window, cx| {
-            let label: SharedString = payload.name.clone().into();
-            let is_dir = payload.is_dir;
+        .on_drag(drag, |payload, _offset, _window, cx| {
+            let label = payload.label();
+            let is_dir = payload.all_dirs();
             cx.new(|_| DragPreview { label, is_dir })
         });
 
     row.into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DragItem, FileDrag, QueuedDownload, Selection, Side, TransferRequest,
+        partition_download_conflicts,
+    };
+    use crate::model::FileEntry;
+    use std::collections::HashSet;
+
+    fn entry(name: &str, is_dir: bool) -> FileEntry {
+        FileEntry {
+            name: name.to_string(),
+            path: format!("/tmp/{name}"),
+            is_dir,
+            size: 0,
+            modified: None,
+            permissions: None,
+            hidden: false,
+        }
+    }
+
+    #[test]
+    fn plain_click_replaces_the_selection() {
+        let mut selection = Selection::default();
+        selection.apply_click(2, false, false, 5);
+        assert_eq!(selection.indices, HashSet::from([2]));
+        selection.apply_click(4, false, false, 5);
+        assert_eq!(selection.indices, HashSet::from([4]));
+        assert!(!selection.is_multi());
+    }
+
+    #[test]
+    fn secondary_click_toggles_items() {
+        let mut selection = Selection::default();
+        selection.apply_click(1, false, false, 5);
+        selection.apply_click(3, false, true, 5);
+        assert!(selection.is_multi());
+        assert_eq!(selection.indices, HashSet::from([1, 3]));
+        selection.apply_click(3, false, true, 5);
+        assert_eq!(selection.indices, HashSet::from([1]));
+        assert!(!selection.is_multi());
+    }
+
+    #[test]
+    fn shift_click_selects_an_inclusive_range_from_the_anchor() {
+        let mut selection = Selection::default();
+        selection.apply_click(1, false, false, 6);
+        selection.apply_click(4, true, false, 6);
+        assert_eq!(selection.indices, HashSet::from([1, 2, 3, 4]));
+        assert!(selection.is_multi());
+
+        // Dragging the range backwards keeps the original anchor.
+        selection.apply_click(2, true, false, 6);
+        assert_eq!(selection.indices, HashSet::from([1, 2]));
+    }
+
+    #[test]
+    fn selection_drops_indices_beyond_the_listing() {
+        let mut selection = Selection::default();
+        selection.apply_click(4, false, false, 6);
+        selection.apply_click(2, false, true, 6);
+        selection.retain_valid(3);
+        assert_eq!(selection.indices, HashSet::from([2]));
+        selection.retain_valid(1);
+        assert!(selection.indices.is_empty());
+        assert_eq!(selection.anchor, None);
+    }
+
+    #[test]
+    fn batch_drag_lists_selected_entries_in_listing_order() {
+        let entries = vec![entry("a", false), entry("b", true), entry("c", false)];
+        let mut selection = Selection::default();
+        selection.apply_click(2, false, false, entries.len());
+        selection.apply_click(0, false, true, entries.len());
+
+        let items = selection.drag_items(Side::Local, &entries);
+        let names: Vec<&str> = items.iter().map(|item| item.name.as_str()).collect();
+        assert_eq!(names, ["a", "c"]);
+        assert!(items.iter().all(|item| item.source == Side::Local));
+
+        let drag = FileDrag {
+            source: Side::Local,
+            items: std::sync::Arc::new(items),
+        };
+        assert_eq!(drag.label().to_string(), "2 个项目");
+        assert!(!drag.all_dirs());
+    }
+
+    #[test]
+    fn downloads_wait_for_confirmation_only_when_the_local_name_is_taken() {
+        let dir =
+            std::env::temp_dir().join(format!("rgftp-download-conflict-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("existing.txt"), b"old").unwrap();
+        std::fs::create_dir(dir.join("existing-dir")).unwrap();
+
+        let items = vec![
+            DragItem {
+                source: Side::Remote,
+                path: "/remote/existing.txt".into(),
+                name: "existing.txt".into(),
+                is_dir: false,
+            },
+            DragItem {
+                source: Side::Remote,
+                path: "/remote/existing-dir".into(),
+                name: "existing-dir".into(),
+                is_dir: true,
+            },
+            DragItem {
+                source: Side::Remote,
+                path: "/remote/fresh.txt".into(),
+                name: "fresh.txt".into(),
+                is_dir: false,
+            },
+        ];
+
+        let (ready, conflicts) = partition_download_conflicts(&dir, "session", &items);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].name, "fresh.txt");
+
+        let conflict_names: Vec<&str> = conflicts.iter().map(|item| item.name.as_str()).collect();
+        assert_eq!(conflict_names, ["existing.txt", "existing-dir"]);
+        assert_eq!(conflicts[0].local, dir.join("existing.txt"));
+        assert_eq!(conflicts[0].remote, "/remote/existing.txt");
+        assert_eq!(conflicts[0].session_id, "session");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirmed_download_keeps_its_transfer_targets() {
+        let local = std::env::temp_dir().join("rgftp-confirmed-download.txt");
+        let request = QueuedDownload {
+            session_id: "session".into(),
+            remote: "/remote/file.txt".into(),
+            local: local.clone(),
+            name: "file.txt".into(),
+        }
+        .into_request();
+
+        match request {
+            TransferRequest::Download {
+                session_id,
+                remote,
+                local: target,
+                name,
+            } => {
+                assert_eq!(session_id, "session");
+                assert_eq!(remote, "/remote/file.txt");
+                assert_eq!(target, local);
+                assert_eq!(name, "file.txt");
+            }
+            _ => panic!("expected a download request"),
+        }
+    }
 }
