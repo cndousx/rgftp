@@ -376,8 +376,12 @@ pub struct RgFtpApp {
     show_hidden_files: bool,
     local_search: Entity<InputState>,
     remote_search: Entity<InputState>,
+    remote_path: Entity<InputState>,
     local_query: String,
     remote_query: String,
+    /// A user-initiated remote navigation is waiting for the backend listing,
+    /// so its result must update the path box even while it has focus.
+    pending_path_jump: bool,
     _search_subscriptions: Vec<Subscription>,
     toasts: Vec<ToastItem>,
     next_toast_id: u64,
@@ -436,6 +440,7 @@ impl RgFtpApp {
 
         let local_search = make_input(window, cx, "模糊搜索本地文件", "", false);
         let remote_search = make_input(window, cx, "模糊搜索远程文件", "", false);
+        let remote_path = make_input(window, cx, "粘贴远程路径后按回车跳转", "", false);
 
         let mut app = Self {
             settings,
@@ -466,8 +471,10 @@ impl RgFtpApp {
             show_hidden_files: false,
             local_search: local_search.clone(),
             remote_search: remote_search.clone(),
+            remote_path: remote_path.clone(),
             local_query: String::new(),
             remote_query: String::new(),
+            pending_path_jump: false,
             _search_subscriptions: Vec::new(),
             toasts: Vec::new(),
             next_toast_id: 1,
@@ -498,6 +505,19 @@ impl RgFtpApp {
                     }
                 },
             ),
+            cx.subscribe_in(
+                &remote_path,
+                window,
+                |this: &mut Self, state, event: &gpui_kit::component::input::InputEvent, _, cx| {
+                    if matches!(
+                        event,
+                        gpui_kit::component::input::InputEvent::PressEnter { .. }
+                    ) {
+                        let path = state.read(cx).value().to_string();
+                        this.navigate_remote_path(path, cx);
+                    }
+                },
+            ),
         ];
 
         app.load_local_dir(local_path, cx);
@@ -522,7 +542,9 @@ impl RgFtpApp {
         app._event_task = cx.spawn(async move |this, cx| {
             while let Ok(event) = event_rx.recv().await {
                 if this
-                    .update(cx, |app, cx| app.handle_backend_event(event, cx))
+                    .update_in(cx, |app, window, cx| {
+                        app.handle_backend_event(event, window, cx)
+                    })
                     .is_err()
                 {
                     break;
@@ -533,7 +555,12 @@ impl RgFtpApp {
         app
     }
 
-    fn handle_backend_event(&mut self, event: BackendEvent, cx: &mut Context<Self>) {
+    fn handle_backend_event(
+        &mut self,
+        event: BackendEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match event {
             BackendEvent::Connected { profile_id, home } => {
                 let Some(profile) = self.settings.connection(&profile_id).cloned() else {
@@ -621,6 +648,7 @@ impl RgFtpApp {
                 session_id,
                 path,
                 entries,
+                file_redirect,
             } => {
                 let all_entries = Arc::new(entries);
                 let visible_entries = Arc::new(filter_entries(
@@ -637,6 +665,18 @@ impl RgFtpApp {
                     session.pane.error = None;
                     session.scroll.scroll_to_item(0, ScrollStrategy::Top);
                 }
+                let force_sync =
+                    std::mem::take(&mut self.pending_path_jump) || file_redirect.is_some();
+                self.sync_remote_path_input(force_sync, window, cx);
+
+                if let Some(name) = file_redirect
+                    && self.active_session.as_deref() == Some(session_id.as_str())
+                {
+                    let message = format!("已跳转到 {name} 文件所在目录");
+                    self.status = message.clone().into();
+                    self.status_kind = StatusKind::Info;
+                    self.push_toast(ToastKind::Success, message, cx);
+                }
                 Self::refresh_scrollbar_layout(cx);
             }
             BackendEvent::ListFailed {
@@ -649,6 +689,8 @@ impl RgFtpApp {
                     session.pane.loading = false;
                     session.pane.error = Some(error.clone());
                 }
+                let force_sync = std::mem::take(&mut self.pending_path_jump);
+                self.sync_remote_path_input(force_sync, window, cx);
                 if self.active_session.as_deref() == Some(session_id.as_str()) {
                     self.status = error.into();
                     self.status_kind = StatusKind::Error;
@@ -836,6 +878,9 @@ impl RgFtpApp {
             }
         }
 
+        // Disconnects and session fallbacks change which path is shown even
+        // when no listing arrives, so keep the path box in step.
+        self.sync_remote_path_input(false, window, cx);
         self.sync_taskbar_progress();
         cx.notify();
     }
@@ -1105,6 +1150,49 @@ impl RgFtpApp {
         }
     }
 
+    /// Resolves a path pasted into the remote path box. Directories open
+    /// directly; file paths open their parent directory and explain the jump.
+    fn navigate_remote_path(&mut self, raw: String, cx: &mut Context<Self>) {
+        let path = raw.trim().to_string();
+        if path.is_empty() {
+            return;
+        }
+        let Some(session_id) = self.active_session.clone() else {
+            self.push_toast(ToastKind::Error, "请先连接服务器", cx);
+            return;
+        };
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return;
+        };
+        session.pane.path = path.clone();
+        session.pane.loading = true;
+        session.pane.error = None;
+        session.pane.selected = None;
+        self.pending_path_jump = true;
+        self.worker
+            .send(BackendCommand::Locate { session_id, path });
+        cx.notify();
+    }
+
+    /// Mirrors the active session's path into the editable path box. While the
+    /// box has focus it is left alone unless `force` is set, so background
+    /// refreshes cannot overwrite a path the user is typing.
+    fn sync_remote_path_input(&mut self, force: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let path = self
+            .active_session_state()
+            .map(|session| session.pane.path.clone())
+            .unwrap_or_default();
+        let state = self.remote_path.clone();
+        state.update(cx, |state, cx| {
+            if state.value().as_ref() == path {
+                return;
+            }
+            if force || !state.focus_handle(cx).is_focused(window) {
+                state.set_value(path, window, cx);
+            }
+        });
+    }
+
     fn open_remote_dir(&mut self, path: String, cx: &mut Context<Self>) {
         let Some(session_id) = self.active_session.clone() else {
             return;
@@ -1116,6 +1204,9 @@ impl RgFtpApp {
         session.pane.loading = true;
         session.pane.error = None;
         session.pane.selected = None;
+        // Mouse navigation should refresh the path box immediately, even if
+        // the box still holds focus from an earlier edit.
+        self.pending_path_jump = true;
         self.worker.send(BackendCommand::List { session_id, path });
         cx.notify();
     }
@@ -3106,7 +3197,7 @@ impl RgFtpApp {
                     .on_click(cx.listener({
                         let id = connection.id.clone();
                         let name = connection.name.clone();
-                        move |this, event: &ClickEvent, _, cx| {
+                        move |this, event: &ClickEvent, window, cx| {
                             if !event.standard_click() || event.click_count() < 2 {
                                 return;
                             }
@@ -3121,6 +3212,7 @@ impl RgFtpApp {
                                     this.disconnect(cx);
                                 } else {
                                     this.active_session = Some(id.clone());
+                                    this.sync_remote_path_input(true, window, cx);
                                     this.status = format!("已切换到 {name}").into();
                                     this.status_kind = StatusKind::Info;
                                     cx.notify();
@@ -3801,11 +3893,6 @@ impl RgFtpApp {
                 );
         }
 
-        let path = self
-            .active_session_state()
-            .map(|session| session.pane.path.clone())
-            .unwrap_or_else(|| "连接服务器后显示远程目录".to_string());
-
         v_flex()
             .gap_2()
             .p_3()
@@ -3813,17 +3900,13 @@ impl RgFtpApp {
             .border_color(colors.border)
             .child(title)
             .child(
-                div()
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .bg(colors.muted)
-                    .text_xs()
-                    .font_family(mono)
-                    .text_color(colors.muted_foreground)
-                    .text_ellipsis()
-                    .whitespace_nowrap()
-                    .child(path),
+                div().px_2().py_1().rounded_sm().bg(colors.muted).child(
+                    Input::new(&self.remote_path)
+                        .xsmall()
+                        .appearance(false)
+                        .font_family(mono)
+                        .disabled(!connected),
+                ),
             )
             .child(
                 Input::new(&self.remote_search).cleanable(true).prefix(
@@ -4506,10 +4589,11 @@ impl RgFtpApp {
                             cx.listener({
                                 let id = id.clone();
                                 let name = name.clone();
-                                move |this, _, _, cx| {
+                                move |this, _, window, cx| {
                                     cx.stop_propagation();
                                     this.context_menu = None;
                                     this.active_session = Some(id.clone());
+                                    this.sync_remote_path_input(true, window, cx);
                                     this.status = format!("已切换到 {name}").into();
                                     this.status_kind = StatusKind::Info;
                                     cx.notify();

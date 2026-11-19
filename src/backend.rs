@@ -52,6 +52,9 @@ pub enum BackendEvent {
         session_id: String,
         path: String,
         entries: Vec<FileEntry>,
+        /// Set when the requested path was a file and `path` is its parent
+        /// directory instead, so the UI can explain the redirect.
+        file_redirect: Option<String>,
     },
     ListFailed {
         session_id: String,
@@ -124,6 +127,12 @@ pub enum BackendCommand {
         profile: ConnectionProfile,
     },
     List {
+        session_id: String,
+        path: String,
+    },
+    /// Resolves a user-typed path: directories are listed directly, while a
+    /// file path opens and lists its parent directory.
+    Locate {
         session_id: String,
         path: String,
     },
@@ -323,6 +332,7 @@ impl SftpWorker {
                                                         session_id: profile.id.clone(),
                                                         path,
                                                         entries,
+                                                        file_redirect: None,
                                                     })
                                                     .await;
                                             }
@@ -368,6 +378,41 @@ impl SftpWorker {
                                                 session_id,
                                                 path,
                                                 entries,
+                                                file_redirect: None,
+                                            })
+                                            .await;
+                                    }
+                                    Err(error) => {
+                                        let _ = events
+                                            .send(BackendEvent::ListFailed {
+                                                session_id,
+                                                path,
+                                                error,
+                                            })
+                                            .await;
+                                    }
+                                }
+                            }
+                            BackendCommand::Locate { session_id, path } => {
+                                let Some(active) = clients.get(&session_id) else {
+                                    let _ = events
+                                        .send(BackendEvent::ListFailed {
+                                            session_id,
+                                            path,
+                                            error: "尚未连接服务器".to_string(),
+                                        })
+                                        .await;
+                                    continue;
+                                };
+
+                                match locate_remote(&active.sftp, &path).await {
+                                    Ok((path, entries, file_redirect)) => {
+                                        let _ = events
+                                            .send(BackendEvent::Listed {
+                                                session_id,
+                                                path,
+                                                entries,
+                                                file_redirect,
                                             })
                                             .await;
                                     }
@@ -960,6 +1005,45 @@ async fn list_dir(sftp: &SftpSession, path: &str) -> Result<(String, Vec<FileEnt
     }
     sort_entries(&mut entries);
     Ok((canonical, entries))
+}
+
+/// Resolves a pasted path. A directory is listed as usual; a file path falls
+/// back to its parent directory, returning the file name so the UI can say
+/// where it jumped to.
+async fn locate_remote(
+    sftp: &SftpSession,
+    path: &str,
+) -> Result<(String, Vec<FileEntry>, Option<String>), String> {
+    match list_dir(sftp, path).await {
+        Ok((directory, entries)) => Ok((directory, entries, None)),
+        Err(list_error) => {
+            // Listing failed, so the path is most likely a file. `metadata`
+            // still works for file paths even when a server refuses to resolve
+            // them with `canonicalize`.
+            let metadata = sftp
+                .metadata(path.to_string())
+                .await
+                .map_err(|_| list_error.clone())?;
+            if metadata.file_type().is_dir() {
+                return Err(list_error);
+            }
+
+            let trimmed = path.trim_end_matches('/');
+            let parent = match trimmed.rfind('/') {
+                Some(0) => "/".to_string(),
+                Some(index) => trimmed[..index].to_string(),
+                None => ".".to_string(),
+            };
+            let (directory, entries) = list_dir(sftp, &parent).await?;
+            let name = trimmed
+                .rsplit('/')
+                .next()
+                .filter(|name| !name.is_empty())
+                .unwrap_or(path)
+                .to_string();
+            Ok((directory, entries, Some(name)))
+        }
+    }
 }
 
 /// Deletes a remote file, or a directory and everything below it.
